@@ -21,7 +21,7 @@ A payments company receives natural-language requests such as
 
 ## Architecture
 
-```
+```text
                         ┌──────────────── feedback ────────────────┐
                         ▼                                          │
 START ─► intake ─► fraud_analyst ─► compliance_officer ─► human_review ─ approve ─► execute_action ─► END
@@ -79,9 +79,26 @@ renders it as interactive cells (`# %%`) and you can run it cell by cell without
 `get_secret()` tries Colab Secrets first, then `.env`, then plain environment variables, so
 the identical notebook runs unmodified in both environments. **No key is ever written in code.**
 
+## Model configuration
+
+Two constants at the top of the notebook control the model:
+
+```python
+MODEL_NAME = "claude-opus-5"    # swap to "claude-sonnet-5" for a cheaper run
+EFFORT     = "medium"           # low | medium | high | xhigh | max
+```
+
+Two details matter on the Claude 5 family and are handled in the code:
+
+* **No `temperature`** — sampling parameters were removed on these models and the API
+  rejects them with a 400.
+* **Native structured outputs** — the agents use
+  `with_structured_output(schema, method="json_schema")` rather than LangChain's default
+  forced tool calling, which conflicts with adaptive thinking.
+
 ## Tests
 
-35 unit and integration tests run without an API key — the graph is exercised end to end
+40 unit and integration tests run without an API key — the graph is exercised end to end
 against a scripted fake LLM (real `interrupt()`, real checkpointer, real routing):
 
 ```bash
@@ -98,10 +115,10 @@ python -m jupytext --to ipynb --set-kernel python3 fraud_multi_agent.py -o Fraud
 
 ## Project layout
 
-```
+```text
 Fraud_Detection_Multi_Agent.ipynb   the submission notebook (generated)
 fraud_multi_agent.py                same code as a VS Code / jupytext script
-tests/                              35 tests (tools, rules, routers, full graph runs)
+tests/                              40 tests (tools, rules, routers, request shape, graph runs)
 .env.example                        template for the local API key
 requirements-dev.txt                dependencies for local development
 docs/superpowers/                   design spec and implementation plan

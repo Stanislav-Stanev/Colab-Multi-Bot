@@ -42,7 +42,8 @@
 # %%
 import os
 
-MODEL_NAME = "claude-sonnet-5"
+MODEL_NAME = "claude-opus-5"    # swap to "claude-sonnet-5" for a cheaper run
+EFFORT = "medium"               # reasoning effort: low | medium | high | xhigh | max
 SKIP_DEMOS = os.getenv("FRAUD_SKIP_DEMOS") == "1"   # lets automated tests import this file
 
 
@@ -72,15 +73,29 @@ def get_secret(name: str) -> str:
 _llm_cache = {}
 
 
-def get_llm(temperature: float = 0.0):
-    """Lazily build the ChatAnthropic client (so importing this file needs no API key)."""
-    if temperature not in _llm_cache:
+def get_llm():
+    """Lazily build the ChatAnthropic client (so importing this file needs no API key).
+
+    No `temperature` is passed: sampling parameters were removed on the Claude 5 models
+    and the API rejects them with a 400. Determinism comes from the tools, not the LLM.
+    """
+    if "client" not in _llm_cache:
         from langchain_anthropic import ChatAnthropic
-        _llm_cache[temperature] = ChatAnthropic(
-            model=MODEL_NAME, temperature=temperature, max_tokens=4096,
+        _llm_cache["client"] = ChatAnthropic(
+            model=MODEL_NAME, max_tokens=16000,
+            output_config={"effort": EFFORT},
             api_key=get_secret("ANTHROPIC_API_KEY"),
         )
-    return _llm_cache[temperature]
+    return _llm_cache["client"]
+
+
+def structured(schema):
+    """LLM that returns an instance of `schema`.
+
+    Uses Claude's native structured outputs (`json_schema`) rather than LangChain's
+    default forced tool calling, which conflicts with adaptive thinking on Claude 5.
+    """
+    return get_llm().with_structured_output(schema, method="json_schema")
 
 # %% [markdown]
 # ## 2. Mock data & custom tools
@@ -347,7 +362,7 @@ def fraud_analyst(state: FraudWorkflowState) -> dict:
     # Summarise the tool evidence as plain text: the structured-output call then runs on a
     # clean context, instead of replaying tool_use blocks the schema-only request can't resolve.
     summary = "\n".join(evidence) or "No tool evidence was collected."
-    assessment = get_llm().with_structured_output(RiskAssessment).invoke([
+    assessment = structured(RiskAssessment).invoke([
         SystemMessage(content=FRAUD_ANALYST_PROMPT),
         HumanMessage(content=f"Original request: {state['user_request']}\n\n"
                              f"Tool evidence collected:\n{summary}\n\n"
@@ -373,7 +388,7 @@ def compliance_officer(state: FraudWorkflowState) -> dict:
     if feedback:
         content += (f"\n\nPrevious report:\n{state['report']}\n\n"
                     f"HUMAN REVIEWER FEEDBACK (you must address it): {feedback}")
-    result = get_llm().with_structured_output(ComplianceReport).invoke(
+    result = structured(ComplianceReport).invoke(
         [SystemMessage(content=COMPLIANCE_OFFICER_PROMPT), HumanMessage(content=content)])
     print(f"   ✅ recommendation: {result.recommended_action} — {result.justification[:100]}")
     return {"report": result.report_markdown,

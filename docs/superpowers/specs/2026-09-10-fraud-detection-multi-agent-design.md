@@ -82,7 +82,7 @@ Rejected alternatives: **B** supervisor/router agent (extra complexity, no rubri
 
 - `get_secret(name)`: try `google.colab.userdata.get(name)` → fall back to `dotenv` `.env` → `os.environ`. Raises a clear message telling the user where to put the key in each environment.
 - `%pip install -qU langgraph langchain langchain-anthropic python-dotenv` as the first code cell (works in both environments).
-- Model: `claude-sonnet-5` via `langchain-anthropic` (configurable constant at the top).
+- Model: `claude-opus-5` via `langchain-anthropic` (configurable constant at the top).
 - No other environment-specific code anywhere.
 
 ## 5. Notebook structure

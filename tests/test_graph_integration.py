@@ -35,7 +35,8 @@ class FakeLLM:
         clone._tools = tools
         return clone
 
-    def with_structured_output(self, schema):
+    def with_structured_output(self, schema, method=None):
+        assert method == "json_schema", "must use native structured outputs, not forced tools"
         return _StructuredFake(schema, self.script)
 
     def invoke(self, messages):
@@ -94,7 +95,7 @@ class Script:
 def scripted(monkeypatch):
     def install(customer_id, recommended_action="BLOCK"):
         script = Script(customer_id, recommended_action)
-        monkeypatch.setattr(m, "get_llm", lambda temperature=0.0: FakeLLM(script))
+        monkeypatch.setattr(m, "get_llm", lambda: FakeLLM(script))
         return script
     return install
 
