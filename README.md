@@ -136,7 +136,7 @@ otherwise fails only at runtime with a live key:
 
 ## Tests
 
-58 unit and integration tests run without an API key — the graph is exercised end to end
+62 unit and integration tests run without an API key — the graph is exercised end to end
 against a scripted fake LLM (real `interrupt()`, real checkpointer, real routing):
 
 ```bash
@@ -148,15 +148,25 @@ python -m pytest tests/ -v
 `fraud_multi_agent.py` is the source of truth; the notebook is generated from it:
 
 ```bash
-python -m jupytext --to ipynb --set-kernel python3 fraud_multi_agent.py -o Fraud_Detection_Multi_Agent.ipynb
+python build_notebook.py          # regenerate
+python build_notebook.py --run    # regenerate, then execute with a live key
 ```
+
+Use that script rather than calling `jupytext` directly. Both jupytext and nbclient read
+and write the notebook in the process's locale encoding, so on a Windows console set to a
+legacy code page (cp1251, cp1252, …) every emoji in the notebook is silently rewritten as
+mojibake — `📥` becomes `рџ“Ґ` — and a later `jupyter execute` fails outright with
+`UnicodeDecodeError: 'charmap' codec can't decode byte 0x98`. The script forces UTF-8 for
+the child processes and refuses to leave a corrupted notebook behind; four tests in
+`tests/test_notebook_encoding.py` fail if one slips through anyway.
 
 ## Project layout
 
 ```text
 Fraud_Detection_Multi_Agent.ipynb   the submission notebook (generated)
 fraud_multi_agent.py                same code as a VS Code / jupytext script
-tests/                              58 tests (tools, rules, routers, request shape, graph runs)
+build_notebook.py                   regenerates the notebook with UTF-8 enforced
+tests/                              62 tests (tools, rules, routers, request shape, graph, encoding)
 .env.example                        template for the local API key
 requirements-dev.txt                dependencies for local development
 docs/superpowers/                   design spec and implementation plan
