@@ -49,27 +49,15 @@ def test_every_model_in_pricing_is_priced():
         assert price_in > 0 and price_out > price_in, name
 
 
-def test_usage_tracker_accumulates_and_prices(monkeypatch):
-    class FakeGeneration:
-        def __init__(self, inp, out):
-            self.message = type("M", (), {
-                "usage_metadata": {"input_tokens": inp, "output_tokens": out}})()
-
-    tracker = m.UsageTracker()
-    tracker.on_llm_end(type("R", (), {"generations": [[FakeGeneration(1000, 200)],
-                                                      [FakeGeneration(500, 100)]]})())
-    assert tracker.calls == 2
-    assert tracker.input_tokens == 1500 and tracker.output_tokens == 300
-
-    monkeypatch.setattr(m, "MODEL_NAME", "claude-haiku-4-5")   # $1 / $5 per 1M
-    assert tracker.cost_usd == pytest.approx(1500 / 1e6 * 1.0 + 300 / 1e6 * 5.0)
-    assert "2 LLM calls" in tracker.report()
+def test_the_observer_is_registered_as_a_callback(llm):
+    """Token usage is captured without any call site reporting it."""
+    assert m.OBS in (llm.callbacks or []), "the LLM client must report usage to the observer"
 
 
-def test_usage_tracker_survives_a_response_without_usage():
-    tracker = m.UsageTracker()
-    tracker.on_llm_end(type("R", (), {"generations": [[object()]]})())
-    assert tracker.calls == 0
+def test_observer_survives_a_response_without_usage():
+    observer = m.WorkflowObserver()
+    observer.on_llm_end(type("R", (), {"generations": [[object()]]})())
+    assert observer.calls == 0
 
 
 def test_structured_output_uses_native_json_schema_not_forced_tools(llm):

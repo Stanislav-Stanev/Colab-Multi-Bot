@@ -43,8 +43,11 @@
 # so the same notebook runs unmodified in Colab and VS Code. **No keys in code!**
 
 # %%
+import functools
+import json
 import os
 import sys
+from typing import Optional
 
 from langchain_core.callbacks import BaseCallbackHandler
 
@@ -89,33 +92,265 @@ def get_secret(name: str) -> str:
     )
 
 
-class UsageTracker(BaseCallbackHandler):
-    """Adds up token usage across every agent call, so the run can report what it cost."""
+def get_secret_or_none(name: str) -> Optional[str]:
+    """`get_secret` for optional keys: returns None instead of raising."""
+    try:
+        return get_secret(name)
+    except RuntimeError:
+        return None
+
+# %% [markdown]
+# ## 1.5 Observability & logging
+# A workflow that only prints cannot be operated. This section adds three things the
+# rest of the notebook builds on:
+#
+# * **`log`** — a real `logging.Logger`, so the trace has levels, can be quieted, and is
+#   captured by pytest. At `INFO` it prints the message alone, so the readable agent trace
+#   below looks exactly as it would with `print`.
+# * **`OBS`** — a `WorkflowObserver` that is *also* a LangChain callback handler. It records
+#   a structured event for every node, tool call, interruption and human decision, times
+#   each node, and attributes tokens and cost **to the agent that spent them**.
+# * **`enable_langsmith()`** — opt-in hosted tracing. Off unless a `LANGSMITH_API_KEY`
+#   exists, so nothing leaves the machine by default.
+
+# %%
+import logging
+import time
+import uuid
+from dataclasses import dataclass, field, asdict
+
+LOGGER_NAME = "fraud"
+
+
+def setup_logging(level: str = "INFO") -> logging.Logger:
+    """Configure the workflow logger. Safe to call repeatedly.
+
+    Re-running a cell in Colab would otherwise attach a second handler and print every
+    later line twice, so existing handlers are cleared first.
+    """
+    logger = logging.getLogger(LOGGER_NAME)
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+
+    handler = logging.StreamHandler(sys.stdout)
+    # At INFO the message stands alone (the readable agent trace); anything else is an
+    # operational event and gets the level and logger name attached.
+    handler.setFormatter(logging.Formatter(
+        "%(message)s" if level.upper() == "INFO" else "%(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(handler)
+    logger.setLevel(level.upper())
+    logger.propagate = False          # the root logger would otherwise print it again
+    return logger
+
+
+log = setup_logging("INFO")
+
+
+@dataclass
+class NodeStats:
+    """What one graph node cost across a run."""
+    calls: int = 0
+    seconds: float = 0.0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    errors: int = 0
+
+    def cost_usd(self, model: str) -> float:
+        price_in, price_out = PRICING.get(model, (0.0, 0.0))
+        return self.input_tokens / 1e6 * price_in + self.output_tokens / 1e6 * price_out
+
+
+class WorkflowObserver(BaseCallbackHandler):
+    """Structured record of a workflow run: events, per-node timings, tokens and cost.
+
+    It is registered as a callback on the shared LLM client, so token usage is captured
+    without any call site having to report it. `current_node`, set by `@observe_node`,
+    is what lets a call be attributed to the agent that made it.
+    """
 
     def __init__(self):
-        self.calls = self.input_tokens = self.output_tokens = 0
+        self.events: list = []
+        self.nodes: dict = {}
+        self.current_node: Optional[str] = None
+        self.run_id: Optional[str] = None
+        self.thread_id: Optional[str] = None
+        self._t0 = time.perf_counter()
 
+    # ---- recording -------------------------------------------------------------
+    def stats(self, node: str) -> NodeStats:
+        return self.nodes.setdefault(node, NodeStats())
+
+    def record(self, event: str, **fields) -> dict:
+        entry = {"elapsed_s": round(time.perf_counter() - self._t0, 3),
+                 "run_id": self.run_id, "thread_id": self.thread_id,
+                 "node": self.current_node, "event": event, **fields}
+        self.events.append(entry)
+        return entry
+
+    def start_run(self, thread_id: str, user_request: str) -> str:
+        self.run_id = f"run-{uuid.uuid4().hex[:8]}"
+        self.thread_id = thread_id
+        self._t0 = time.perf_counter()
+        self.current_node = None
+        self.record("run_start", user_request=user_request, model=MODEL_NAME)
+        log.debug("run %s started on thread %s", self.run_id, thread_id)
+        return self.run_id
+
+    def end_run(self, status: str) -> None:
+        self.record("run_end", status=status, cost_usd=round(self.cost_usd, 6))
+
+    # ---- LangChain callback hooks ----------------------------------------------
     def on_llm_end(self, response, **kwargs) -> None:
         for generations in response.generations:
             for generation in generations:
                 usage = getattr(getattr(generation, "message", None), "usage_metadata", None)
-                if usage:
-                    self.calls += 1
-                    self.input_tokens += usage.get("input_tokens", 0)
-                    self.output_tokens += usage.get("output_tokens", 0)
+                if not usage:
+                    continue
+                stats = self.stats(self.current_node or "unattributed")
+                stats.input_tokens += usage.get("input_tokens", 0)
+                stats.output_tokens += usage.get("output_tokens", 0)
+                self.record("llm_call",
+                            input_tokens=usage.get("input_tokens", 0),
+                            output_tokens=usage.get("output_tokens", 0))
+
+    def on_llm_error(self, error, **kwargs) -> None:
+        self.stats(self.current_node or "unattributed").errors += 1
+        self.record("error", where="llm", error_type=type(error).__name__, message=str(error))
+        log.error("LLM call failed in %s: %s", self.current_node, error)
+
+    def on_tool_error(self, error, **kwargs) -> None:
+        self.stats(self.current_node or "unattributed").errors += 1
+        self.record("error", where="tool", error_type=type(error).__name__, message=str(error))
+        log.error("tool failed in %s: %s", self.current_node, error)
+
+    # ---- reporting --------------------------------------------------------------
+    @property
+    def calls(self) -> int:
+        return sum(1 for e in self.events if e["event"] == "llm_call")
+
+    @property
+    def input_tokens(self) -> int:
+        return sum(s.input_tokens for s in self.nodes.values())
+
+    @property
+    def output_tokens(self) -> int:
+        return sum(s.output_tokens for s in self.nodes.values())
 
     @property
     def cost_usd(self) -> float:
-        price_in, price_out = PRICING.get(MODEL_NAME, (0.0, 0.0))
-        return self.input_tokens / 1e6 * price_in + self.output_tokens / 1e6 * price_out
+        return sum(s.cost_usd(MODEL_NAME) for s in self.nodes.values())
 
     def report(self) -> str:
         return (f"{self.calls} LLM calls · {self.input_tokens:,} input + "
                 f"{self.output_tokens:,} output tokens · ≈ ${self.cost_usd:.4f} "
                 f"on {MODEL_NAME}")
 
+    def summary(self) -> str:
+        """Per-node table: where the time and the money actually went."""
+        header = (f"{'node':<22}{'calls':>6}{'seconds':>9}{'in tok':>9}"
+                  f"{'out tok':>9}{'cost $':>10}{'err':>5}")
+        lines = [header, "-" * len(header)]
+        for name, s in sorted(self.nodes.items(), key=lambda kv: -kv[1].seconds):
+            lines.append(f"{name:<22}{s.calls:>6}{s.seconds:>9.2f}{s.input_tokens:>9,}"
+                         f"{s.output_tokens:>9,}{s.cost_usd(MODEL_NAME):>10.4f}{s.errors:>5}")
+        lines.append("-" * len(header))
+        total_s = sum(s.seconds for s in self.nodes.values())
+        lines.append(f"{'TOTAL':<22}{self.calls:>6}{total_s:>9.2f}{self.input_tokens:>9,}"
+                     f"{self.output_tokens:>9,}{self.cost_usd:>10.4f}"
+                     f"{sum(s.errors for s in self.nodes.values()):>5}")
+        return "\n".join(lines)
 
-USAGE = UsageTracker()
+    def timeline(self, limit: int = 40) -> str:
+        rows = [f"{e['elapsed_s']:>8.2f}s  {str(e['node'] or '-'):<20} {e['event']}"
+                for e in self.events[-limit:]]
+        return "\n".join(rows)
+
+    def errors(self) -> list:
+        return [e for e in self.events if e["event"] == "error"]
+
+    def to_json(self, path: str = "workflow_events.json") -> str:
+        """Persist the structured log, so a run can be inspected after the kernel is gone."""
+        payload = {"model": MODEL_NAME, "cost_usd": round(self.cost_usd, 6),
+                   "nodes": {k: asdict(v) for k, v in self.nodes.items()},
+                   "events": self.events}
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, ensure_ascii=False)
+        return path
+
+
+OBS = WorkflowObserver()
+
+
+def is_control_flow(exc: BaseException) -> bool:
+    """True for LangGraph's pause signal.
+
+    `interrupt()` suspends the graph by *raising* `GraphInterrupt`. Counting that as a
+    failure would report six errors for a clean run and bury real ones — observability
+    that cries wolf is worse than none.
+    """
+    try:
+        from langgraph.errors import GraphInterrupt
+        return isinstance(exc, GraphInterrupt)
+    except ImportError:                      # pragma: no cover - langgraph always present
+        return type(exc).__name__ == "GraphInterrupt"
+
+
+def observe_node(name: str):
+    """Instrument a graph node: time it, attribute its tokens, record its failures.
+
+    Errors are recorded and logged, then re-raised — observability must never swallow a
+    failure it is supposed to be reporting.
+    """
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(state, *args, **kwargs):
+            previous, OBS.current_node = OBS.current_node, name
+            stats = OBS.stats(name)
+            stats.calls += 1
+            tokens_before = stats.input_tokens + stats.output_tokens
+            OBS.record("node_start")
+            started = time.perf_counter()
+            try:
+                return fn(state, *args, **kwargs)
+            except Exception as exc:
+                if is_control_flow(exc):
+                    OBS.record("node_paused")     # the human-in-the-loop gate, not a fault
+                    raise
+                stats.errors += 1
+                OBS.record("error", where="node", error_type=type(exc).__name__,
+                           message=str(exc)[:500])
+                log.error("node %s failed: %s: %s", name, type(exc).__name__, exc)
+                raise
+            finally:
+                elapsed = time.perf_counter() - started
+                stats.seconds += elapsed
+                OBS.record("node_end", seconds=round(elapsed, 3),
+                           tokens=stats.input_tokens + stats.output_tokens - tokens_before)
+                OBS.current_node = previous
+        return wrapper
+    return decorator
+
+
+def enable_langsmith(project: str = "fraud-multi-agent") -> bool:
+    """Turn on LangSmith tracing, but only if a key exists. Off by default."""
+    key = get_secret_or_none("LANGSMITH_API_KEY")
+    if not key:
+        log.info("📡 LangSmith tracing: off (no LANGSMITH_API_KEY) — local observability only")
+        return False
+    os.environ["LANGCHAIN_TRACING_V2"] = "true"
+    os.environ["LANGCHAIN_API_KEY"] = key
+    os.environ["LANGCHAIN_PROJECT"] = project
+    log.info("📡 LangSmith tracing: ON, project %r", project)
+    return True
+
+
+# %%
+# Hosted tracing is opt-in and stays off unless a key exists. Local observability above
+# works either way. Set the log level to "DEBUG" here to see the operational events too.
+if not SKIP_DEMOS:
+    enable_langsmith()
+
+# %%
 _llm_cache = {}
 
 
@@ -132,7 +367,7 @@ def get_llm():
         options = {"output_config": {"effort": EFFORT}} if EFFORT else {}
         _llm_cache["client"] = ChatAnthropic(
             model=MODEL_NAME, max_tokens=16000,
-            callbacks=[USAGE],
+            callbacks=[OBS],          # token usage is captured without touching call sites
             api_key=get_secret("ANTHROPIC_API_KEY"),
             **options,
         )
@@ -154,7 +389,6 @@ def structured(schema):
 # patterns (card testing, velocity, geo anomaly, amount outlier).
 
 # %%
-import json
 from datetime import datetime
 from statistics import median
 from langchain_core.tools import tool
@@ -311,7 +545,7 @@ TOOLS = [fetch_customer_transactions, calculate_risk_score, check_sanctions_list
 
 # %%
 import re
-from typing import Annotated, Literal, Optional, TypedDict
+from typing import Annotated, Literal, TypedDict
 from pydantic import BaseModel, Field
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.graph import StateGraph, START, END
@@ -379,9 +613,10 @@ def _extract_customer_id(text: str) -> Optional[str]:
     return f"CUST-{match.group(1)}" if match else None
 
 
+@observe_node("intake")
 def intake(state: FraudWorkflowState) -> dict:
     cid = _extract_customer_id(state["user_request"])
-    print(f"📥 intake: request={state['user_request']!r} → customer_id={cid}")
+    log.info(f"📥 intake: request={state['user_request']!r} → customer_id={cid}")
     if not cid:
         return {"customer_id": None,
                 "messages": [HumanMessage(content=state["user_request"])]}
@@ -402,8 +637,9 @@ def route_after_intake(state) -> str:
     return "followup_qa" if len(state.get("messages") or []) > 1 else "no_customer"
 
 
+@observe_node("fraud_analyst")
 def fraud_analyst(state: FraudWorkflowState) -> dict:
-    print("🔎 Fraud Analyst: investigating...")
+    log.info("🔎 Fraud Analyst: investigating...")
     llm = get_llm().bind_tools(TOOLS)
     msgs = [SystemMessage(content=FRAUD_ANALYST_PROMPT),
             HumanMessage(content=state["user_request"])]
@@ -415,8 +651,12 @@ def fraud_analyst(state: FraudWorkflowState) -> dict:
         if not ai.tool_calls:
             break
         for tc in ai.tool_calls:
-            print(f"   🔧 tool call: {tc['name']}({json.dumps(tc['args'])[:120]})")
+            log.info(f"   🔧 tool call: {tc['name']}({json.dumps(tc['args'])[:120]})")
+            started = time.perf_counter()
             result = tools_by_name[tc["name"]].invoke(tc["args"])
+            OBS.record("tool_call", tool=tc["name"], args=tc["args"],
+                       seconds=round(time.perf_counter() - started, 4),
+                       result_chars=len(result))
             evidence.append(f"{tc['name']}({json.dumps(tc['args'])}) -> {result}")
             if tc["name"] == "fetch_customer_transactions":
                 fetched = json.loads(result)
@@ -442,7 +682,7 @@ def fraud_analyst(state: FraudWorkflowState) -> dict:
                   "triggered_rules": scored["triggered_rules"],
                   "sanctions_match": narrative.sanctions_match,
                   "analyst_notes": narrative.analyst_notes}
-    print(f"   ✅ assessment: score={assessment['risk_score']}, "
+    log.info(f"   ✅ assessment: score={assessment['risk_score']}, "
           f"rules={assessment['triggered_rules']}, sanctions={assessment['sanctions_match']}")
     return {"transactions": transactions,
             "customer_found": bool(found),
@@ -457,21 +697,23 @@ def route_after_analysis(state) -> str:
     return "compliance_officer" if state.get("customer_found") else "customer_not_found"
 
 
+@observe_node("customer_not_found")
 def customer_not_found(state: FraudWorkflowState) -> dict:
     notes = (state.get("risk_assessment") or {}).get("analyst_notes", "")
     out = (f"REVIEW NOT POSSIBLE: no record for {state.get('customer_id')} in the core "
            f"banking system, so there is no activity to assess and no action to take.\n\n"
            f"Analyst: {notes}\n"
            f"Known customers: {', '.join(sorted(CUSTOMER_DB))}.")
-    print(f"🚧 customer_not_found: {state.get('customer_id')} does not exist — stopping")
+    log.info(f"🚧 customer_not_found: {state.get('customer_id')} does not exist — stopping")
     return {"final_output": out, "messages": [AIMessage(content=out)]}
 
 
+@observe_node("compliance_officer")
 def compliance_officer(state: FraudWorkflowState) -> dict:
     revision = state.get("human_decision") or {}
     feedback = revision.get("feedback") if revision.get("type") == "feedback" else None
-    print("📋 Compliance Officer:", "revising report after human feedback..." if feedback
-          else "drafting report...")
+    log.info("📋 Compliance Officer: %s",
+             "revising report after human feedback..." if feedback else "drafting report...")
     content = (f"Fraud analyst assessment (JSON): {json.dumps(state['risk_assessment'])}\n"
                f"Customer: {state.get('customer_id')}")
     if feedback:
@@ -479,7 +721,7 @@ def compliance_officer(state: FraudWorkflowState) -> dict:
                     f"HUMAN REVIEWER FEEDBACK (you must address it): {feedback}")
     result = structured(ComplianceReport).invoke(
         [SystemMessage(content=COMPLIANCE_OFFICER_PROMPT), HumanMessage(content=content)])
-    print(f"   ✅ recommendation: {result.recommended_action} — {result.justification[:100]}")
+    log.info(f"   ✅ recommendation: {result.recommended_action} — {result.justification[:100]}")
     return {"report": result.report_markdown,
             "recommended_action": result.recommended_action,
             "revision_count": (state.get("revision_count") or 0) + (1 if feedback else 0),
@@ -494,6 +736,7 @@ def compliance_officer(state: FraudWorkflowState) -> dict:
 # (`Command(resume=...)`) becomes its return value.
 
 # %%
+@observe_node("human_review")
 def human_review(state: FraudWorkflowState) -> dict:
     # Nothing is printed before interrupt(): the node re-runs from the top when the graph
     # resumes, so anything above this line would appear twice in the transcript.
@@ -504,7 +747,7 @@ def human_review(state: FraudWorkflowState) -> dict:
         "recommended_action": state["recommended_action"],
         "risk_score": (state.get("risk_assessment") or {}).get("risk_score"),
     })
-    print(f"🔄 human_review: resumed with decision={decision}")
+    log.info(f"🔄 human_review: resumed with decision={decision}")
     return {"human_decision": decision,
             "messages": [HumanMessage(content=f"[Human reviewer] {json.dumps(decision)}")]}
 
@@ -521,6 +764,7 @@ def route_after_review(state) -> str:
     return "execute_action"    # approve, or feedback budget exhausted
 
 
+@observe_node("execute_action")
 def execute_action(state: FraudWorkflowState) -> dict:
     action = state["recommended_action"]
     cid = state.get("customer_id") or "N/A"
@@ -529,28 +773,31 @@ def execute_action(state: FraudWorkflowState) -> dict:
                "CLEAR": f"✅ {cid} cleared — no action taken."}
     out = (f"ACTION EXECUTED: {effects.get(action, action)}\n\n--- FINAL COMPLIANCE REPORT ---\n"
            f"{state['report']}")
-    print(f"🏁 execute_action: {action} for {cid}")
+    log.info(f"🏁 execute_action: {action} for {cid}")
     return {"final_output": out, "messages": [AIMessage(content=out)]}
 
 
+@observe_node("cancel_action")
 def cancel_action(state: FraudWorkflowState) -> dict:
     out = (f"ACTION CANCELLED by human reviewer. No changes applied to "
            f"{state.get('customer_id')}. The draft report was archived for audit.")
-    print("🛑 cancel_action")
+    log.info("🛑 cancel_action")
     return {"final_output": out, "messages": [AIMessage(content=out)]}
 
 
+@observe_node("no_customer")
 def no_customer(state: FraudWorkflowState) -> dict:
     """Nothing to investigate and no history to answer from — say so, spend no tokens."""
     out = ("I could not find a customer id in that request. Please include one, "
            f"for example: 'Review CUST-1042 for suspicious activity.' "
            f"Known customers: {', '.join(sorted(CUSTOMER_DB))}.")
-    print("❓ no_customer: no customer id in the request")
+    log.info("❓ no_customer: no customer id in the request")
     return {"final_output": out, "messages": [AIMessage(content=out)]}
 
 
+@observe_node("followup_qa")
 def followup_qa(state: FraudWorkflowState) -> dict:
-    print("💬 followup_qa: answering from conversation memory...")
+    log.info("💬 followup_qa: answering from conversation memory...")
     answer = get_llm().invoke(
         [SystemMessage(content="Answer the user's follow-up question strictly from the "
                                "conversation history of this fraud-review thread.")]
@@ -634,25 +881,41 @@ def _result_of(raw: dict, thread_id: str) -> dict:
 def start_workflow(user_request: str, thread_id: Optional[str] = None) -> dict:
     """Low-level: run the graph until it pauses for human review (or finishes)."""
     thread_id = thread_id or f"thread-{uuid.uuid4().hex[:8]}"
+    OBS.start_run(thread_id, user_request)
     config = {"configurable": {"thread_id": thread_id}}
-    return _result_of(graph.invoke({"user_request": user_request}, config=config), thread_id)
+    result = _result_of(graph.invoke({"user_request": user_request}, config=config), thread_id)
+    if result["status"] == "awaiting_human_review":
+        OBS.record("interrupt",
+                   recommended_action=result["interrupt_payload"].get("recommended_action"),
+                   risk_score=result["interrupt_payload"].get("risk_score"))
+    else:
+        OBS.end_run(result["status"])
+    return result
 
 
 def resume_workflow(thread_id: str, decision: dict) -> dict:
     """Low-level: resume a paused workflow with the human decision:
     {'type':'approve'} | {'type':'feedback','feedback':'...'} | {'type':'reject'}"""
+    OBS.record("human_decision", decision_type=decision.get("type"),
+               feedback=decision.get("feedback"))
     config = {"configurable": {"thread_id": thread_id}}
-    raw = graph.invoke(Command(resume=decision), config=config)
-    return _result_of(raw, thread_id)
+    result = _result_of(graph.invoke(Command(resume=decision), config=config), thread_id)
+    if result["status"] == "awaiting_human_review":
+        OBS.record("interrupt",
+                   recommended_action=result["interrupt_payload"].get("recommended_action"),
+                   risk_score=result["interrupt_payload"].get("risk_score"))
+    else:
+        OBS.end_run(result["status"])
+    return result
 
 
 def show_for_review(payload: dict) -> None:
     """Print the paused report the way a human reviewer needs to see it."""
-    print("\n" + "-" * 88)
-    print(f"⏳ GRAPH INTERRUPTED — awaiting human review "
+    log.info("\n" + "-" * 88)
+    log.info(f"⏳ GRAPH INTERRUPTED — awaiting human review "
           f"(recommended: {payload['recommended_action']}, risk score: {payload['risk_score']})")
-    print("-" * 88)
-    print(payload["report"])
+    log.info("-" * 88)
+    log.info(payload["report"])
 
 
 def ask_human(payload: dict) -> dict:
@@ -783,14 +1046,28 @@ if not SKIP_DEMOS:
     print("💬 Memory-based answer:\n", t7["final_output"])
 
 # %% [markdown]
-# ### What the whole notebook cost
-# Every agent call is counted by a callback on the shared client, so the price of a full
-# run is visible rather than guessed. Switch `MODEL_NAME` at the top to trade cost against
-# depth of reasoning.
+# ## 8.1 Observability report
+# Everything above was recorded. `OBS.summary()` shows where the time and the money went,
+# per agent — the LLM calls were attributed automatically by the callback, so this is
+# measured rather than estimated.
 
 # %%
 if not SKIP_DEMOS:
-    print("💰", USAGE.report())
+    print("💰", OBS.report())
+    print()
+    print(OBS.summary())
+
+# %% [markdown]
+# The structured event log answers "what actually happened, in what order" — including the
+# interruptions and the human's decisions, which is the part a compliance audit cares about.
+
+# %%
+if not SKIP_DEMOS:
+    print("Last events of the final run:")
+    print(OBS.timeline(limit=14))
+    print()
+    print("Errors recorded:", OBS.errors() or "none")
+    print("Full structured log written to:", OBS.to_json())
 
 # %% [markdown]
 # ## 9. Conclusion

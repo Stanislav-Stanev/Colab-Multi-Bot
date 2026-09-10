@@ -134,9 +134,45 @@ otherwise fails only at runtime with a live key:
   `with_structured_output(schema, method="json_schema")` rather than LangChain's default
   forced tool calling, which conflicts with adaptive thinking.
 
+## Observability & logging
+
+Section 1.5 of the notebook. Three pieces, none of which needs an extra package or an
+external service.
+
+**`log` — a real logger, not `print`.** `setup_logging(level)` configures a `logging.Logger`
+named `fraud`. At `INFO` the formatter emits the message alone, so the agent trace reads
+exactly as it would with `print`; at other levels it labels the level and the logger. It is
+idempotent — re-running the cell in Colab would otherwise attach a second handler and print
+every later line twice — and `propagate` is off so the root logger does not echo it.
+
+**`OBS` — a `WorkflowObserver`.** It is a LangChain callback handler registered on the
+shared client, so token usage is captured without any call site reporting it, and the
+`@observe_node` decorator on each graph node supplies the attribution: every LLM call is
+charged to the agent that made it. It records a structured event for each `run_start`,
+`node_start`, `node_end`, `llm_call`, `tool_call`, `interrupt`, `human_decision`, `error`
+and `run_end`.
+
+| Call | What you get |
+|---|---|
+| `OBS.report()` | one line: calls, tokens, cost |
+| `OBS.summary()` | per-node table — calls, seconds, tokens, cost, errors |
+| `OBS.timeline(limit)` | what happened, in order |
+| `OBS.errors()` | only the failures |
+| `OBS.to_json(path)` | the whole structured log, to inspect after the kernel is gone |
+
+An exception inside a node is recorded and logged with the node's name, and then
+**re-raised** — observability must not swallow the failure it exists to report.
+
+**`enable_langsmith()` — opt-in hosted tracing.** It looks for `LANGSMITH_API_KEY` through
+the same secret chain and turns LangChain tracing on only if one exists; otherwise it logs
+one line saying tracing is off and continues. Nothing leaves the machine by default.
+
+*Known limitation:* per-node attribution assumes nodes run one at a time, which is true for
+this graph. Parallel branches would need a contextvar to stay accurate.
+
 ## Tests
 
-62 unit and integration tests run without an API key — the graph is exercised end to end
+85 unit and integration tests run without an API key — the graph is exercised end to end
 against a scripted fake LLM (real `interrupt()`, real checkpointer, real routing):
 
 ```bash
@@ -166,7 +202,7 @@ the child processes and refuses to leave a corrupted notebook behind; four tests
 Fraud_Detection_Multi_Agent.ipynb   the submission notebook (generated)
 fraud_multi_agent.py                same code as a VS Code / jupytext script
 build_notebook.py                   regenerates the notebook with UTF-8 enforced
-tests/                              62 tests (tools, rules, routers, request shape, graph, encoding)
+tests/                              85 tests (tools, rules, routers, requests, graph, observability)
 .env.example                        template for the local API key
 requirements-dev.txt                dependencies for local development
 docs/superpowers/                   design spec and implementation plan
