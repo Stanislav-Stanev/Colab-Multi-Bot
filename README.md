@@ -25,10 +25,11 @@ A payments company receives natural-language requests such as
                         ┌──────────────── feedback ────────────────┐
                         ▼                                          │
 START ─► intake ─► fraud_analyst ─► compliance_officer ─► human_review ─ approve ─► execute_action ─► END
-           │                                              (interrupt) │
-           │                                                          └─ reject ──► cancel_action ──► END
-           ├─ no customer id, prior history ─► followup_qa  ─► END
-           └─ no customer id, fresh thread  ─► no_customer  ─► END
+           │             │                                (interrupt) │
+           │             │                                            └─ reject ──► cancel_action ──► END
+           │             └─ customer not in the system ─► customer_not_found ─► END
+           ├─ no customer id, prior history ─► followup_qa ─► END
+           └─ no customer id, fresh thread  ─► no_customer ─► END
 ```
 
 * **State:** `FraudWorkflowState` (`TypedDict`) carries the request, customer id, transactions,
@@ -40,6 +41,10 @@ START ─► intake ─► fraud_analyst ─► compliance_officer ─► human_
   `execute_workflow` owns that loop: it pauses, collects the decision, resumes, and repeats
   until the graph produces a final output.
 * **Revision guard:** at most `MAX_REVISIONS = 3` feedback rounds, then the action is finalised.
+* **No action it cannot justify.** Two branches exist so the graph never reaches the human
+  gate empty-handed: a request naming nobody, and a customer the core banking system has
+  never heard of — the latter stops at `customer_not_found` rather than proposing to block
+  a card that does not exist.
 * **The score is computed, not generated.** `fraud_analyst` writes `_score()`'s output into
   the state and lets the model contribute only the narrative, so the number that drives
   BLOCK / MONITOR / CLEAR can never be an LLM transcription error.
@@ -60,7 +65,7 @@ START ─► intake ─► fraud_analyst ─► compliance_officer ─► human_
 | 2 | CUST-1042 | 100 → BLOCK (card testing) | approve | critical action executed |
 | 3 | CUST-1337 | 40 → MONITOR (velocity) | **feedback** → approve | revision loop, human escalates |
 | 4 | CUST-2077 | 40 → MONITOR (geo + crypto/gambling) | **reject** | action cancelled |
-| 5 | CUST-9999 | unknown customer | approve | graceful error handling |
+| 5 | CUST-9999 | unknown customer | *none needed* | stops before any action |
 | 6 | CUST-4444 | 15, but sanctions hit → BLOCK | approve | a rule overriding the score |
 | 7 | — | follow-up in Test 2's thread | — | conversational memory |
 
@@ -99,26 +104,39 @@ renders it as interactive cells (`# %%`) and you can run it cell by cell without
 `get_secret()` tries Colab Secrets first, then `.env`, then plain environment variables, so
 the identical notebook runs unmodified in both environments. **No key is ever written in code.**
 
-## Model configuration
+## Model configuration and cost
 
-Two constants at the top of the notebook control the model:
+Two constants at the top of the notebook pick the model:
 
 ```python
-MODEL_NAME = "claude-opus-5"    # swap to "claude-sonnet-5" for a cheaper run
-EFFORT     = "medium"           # low | medium | high | xhigh | max
+MODEL_NAME = "claude-haiku-4-5"   # cheapest; "claude-sonnet-5" / "claude-opus-5" reason deeper
+EFFORT     = None                 # None on Haiku; "low".."max" on Sonnet 5 / Opus 5
 ```
 
-Two details matter on the Claude 5 family and are handled in the code:
+| Model | USD / 1M in | USD / 1M out | Reasoning effort |
+|---|---|---|---|
+| `claude-haiku-4-5` | $1 | $5 | not supported — must be `None` |
+| `claude-sonnet-5` | $2 | $10 | `low` … `max` |
+| `claude-opus-5` | $5 | $25 | `low` … `max` |
 
-* **No `temperature`** — sampling parameters were removed on these models and the API
-  rejects them with a 400.
+A `UsageTracker` callback counts every agent call, and the last cell prints the run's
+token usage and its cost, so switching models shows its price immediately.
+
+Three details of the current Claude models are handled in the code, each of which
+otherwise fails only at runtime with a live key:
+
+* **No `temperature`** — sampling parameters were removed on the Claude 5 models and the
+  API rejects them with a 400. `langchain-anthropic` strips them only for `claude-fable-5`,
+  so they would otherwise reach the API.
+* **`effort` is omitted entirely unless set** — Haiku 4.5 answers a request carrying the
+  effort parameter with `400 This model does not support the effort parameter`.
 * **Native structured outputs** — the agents use
   `with_structured_output(schema, method="json_schema")` rather than LangChain's default
   forced tool calling, which conflicts with adaptive thinking.
 
 ## Tests
 
-53 unit and integration tests run without an API key — the graph is exercised end to end
+58 unit and integration tests run without an API key — the graph is exercised end to end
 against a scripted fake LLM (real `interrupt()`, real checkpointer, real routing):
 
 ```bash
@@ -138,7 +156,7 @@ python -m jupytext --to ipynb --set-kernel python3 fraud_multi_agent.py -o Fraud
 ```text
 Fraud_Detection_Multi_Agent.ipynb   the submission notebook (generated)
 fraud_multi_agent.py                same code as a VS Code / jupytext script
-tests/                              53 tests (tools, rules, routers, request shape, graph runs)
+tests/                              58 tests (tools, rules, routers, request shape, graph runs)
 .env.example                        template for the local API key
 requirements-dev.txt                dependencies for local development
 docs/superpowers/                   design spec and implementation plan

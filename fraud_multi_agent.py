@@ -46,13 +46,23 @@
 import os
 import sys
 
+from langchain_core.callbacks import BaseCallbackHandler
+
 try:                                    # the agent traces use emoji; Windows consoles
     sys.stdout.reconfigure(encoding="utf-8")   # still default to a legacy code page
 except (AttributeError, ValueError):
     pass
 
-MODEL_NAME = "claude-opus-5"    # swap to "claude-sonnet-5" for a cheaper run
-EFFORT = "medium"               # reasoning effort: low | medium | high | xhigh | max
+# Model choice, cheapest first. Prices are USD per 1M tokens (input, output).
+PRICING = {"claude-haiku-4-5": (1.00, 5.00),     # cheapest; no reasoning-effort control
+           "claude-sonnet-5": (2.00, 10.00),
+           "claude-opus-5": (5.00, 25.00)}
+
+MODEL_NAME = "claude-haiku-4-5"
+# Reasoning effort, or None. Haiku 4.5 rejects the parameter with a 400, so it must stay
+# None there; on Sonnet 5 / Opus 5 use "low".."max" to trade cost against thoroughness.
+EFFORT = None
+
 SKIP_DEMOS = os.getenv("FRAUD_SKIP_DEMOS") == "1"   # lets automated tests import this file
 
 
@@ -79,6 +89,33 @@ def get_secret(name: str) -> str:
     )
 
 
+class UsageTracker(BaseCallbackHandler):
+    """Adds up token usage across every agent call, so the run can report what it cost."""
+
+    def __init__(self):
+        self.calls = self.input_tokens = self.output_tokens = 0
+
+    def on_llm_end(self, response, **kwargs) -> None:
+        for generations in response.generations:
+            for generation in generations:
+                usage = getattr(getattr(generation, "message", None), "usage_metadata", None)
+                if usage:
+                    self.calls += 1
+                    self.input_tokens += usage.get("input_tokens", 0)
+                    self.output_tokens += usage.get("output_tokens", 0)
+
+    @property
+    def cost_usd(self) -> float:
+        price_in, price_out = PRICING.get(MODEL_NAME, (0.0, 0.0))
+        return self.input_tokens / 1e6 * price_in + self.output_tokens / 1e6 * price_out
+
+    def report(self) -> str:
+        return (f"{self.calls} LLM calls · {self.input_tokens:,} input + "
+                f"{self.output_tokens:,} output tokens · ≈ ${self.cost_usd:.4f} "
+                f"on {MODEL_NAME}")
+
+
+USAGE = UsageTracker()
 _llm_cache = {}
 
 
@@ -87,13 +124,17 @@ def get_llm():
 
     No `temperature` is passed: sampling parameters were removed on the Claude 5 models
     and the API rejects them with a 400. Determinism comes from the tools, not the LLM.
+    `output_config` is omitted entirely unless an effort level is set, because Haiku 4.5
+    rejects the effort parameter.
     """
     if "client" not in _llm_cache:
         from langchain_anthropic import ChatAnthropic
+        options = {"output_config": {"effort": EFFORT}} if EFFORT else {}
         _llm_cache["client"] = ChatAnthropic(
             model=MODEL_NAME, max_tokens=16000,
-            output_config={"effort": EFFORT},
+            callbacks=[USAGE],
             api_key=get_secret("ANTHROPIC_API_KEY"),
+            **options,
         )
     return _llm_cache["client"]
 
@@ -740,6 +781,16 @@ if not SKIP_DEMOS:
     t7 = execute_workflow("What was the final risk score and which rules were triggered?",
                           thread_id=t2["thread_id"])
     print("💬 Memory-based answer:\n", t7["final_output"])
+
+# %% [markdown]
+# ### What the whole notebook cost
+# Every agent call is counted by a callback on the shared client, so the price of a full
+# run is visible rather than guessed. Switch `MODEL_NAME` at the top to trade cost against
+# depth of reasoning.
+
+# %%
+if not SKIP_DEMOS:
+    print("💰", USAGE.report())
 
 # %% [markdown]
 # ## 9. Conclusion

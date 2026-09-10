@@ -28,11 +28,48 @@ def test_no_sampling_parameters_are_sent(llm):
         assert removed not in payload, f"{removed} returns a 400 on the Claude 5 models"
 
 
-def test_model_and_effort(llm):
+def test_model_and_max_tokens(llm):
     payload = llm._get_request_payload(MESSAGES)
     assert payload["model"] == m.MODEL_NAME
-    assert payload["output_config"]["effort"] == m.EFFORT
     assert payload["max_tokens"] == 16000
+
+
+def test_effort_is_only_sent_when_the_model_supports_it(llm):
+    """Haiku 4.5 answers a request carrying `effort` with a 400, so it must be omitted."""
+    payload = llm._get_request_payload(MESSAGES)
+    if m.EFFORT is None:
+        assert "effort" not in payload.get("output_config", {})
+    else:
+        assert payload["output_config"]["effort"] == m.EFFORT
+
+
+def test_every_model_in_pricing_is_priced():
+    assert m.MODEL_NAME in m.PRICING, "unknown model would report a $0.00 cost"
+    for name, (price_in, price_out) in m.PRICING.items():
+        assert price_in > 0 and price_out > price_in, name
+
+
+def test_usage_tracker_accumulates_and_prices(monkeypatch):
+    class FakeGeneration:
+        def __init__(self, inp, out):
+            self.message = type("M", (), {
+                "usage_metadata": {"input_tokens": inp, "output_tokens": out}})()
+
+    tracker = m.UsageTracker()
+    tracker.on_llm_end(type("R", (), {"generations": [[FakeGeneration(1000, 200)],
+                                                      [FakeGeneration(500, 100)]]})())
+    assert tracker.calls == 2
+    assert tracker.input_tokens == 1500 and tracker.output_tokens == 300
+
+    monkeypatch.setattr(m, "MODEL_NAME", "claude-haiku-4-5")   # $1 / $5 per 1M
+    assert tracker.cost_usd == pytest.approx(1500 / 1e6 * 1.0 + 300 / 1e6 * 5.0)
+    assert "2 LLM calls" in tracker.report()
+
+
+def test_usage_tracker_survives_a_response_without_usage():
+    tracker = m.UsageTracker()
+    tracker.on_llm_end(type("R", (), {"generations": [[object()]]})())
+    assert tracker.calls == 0
 
 
 def test_structured_output_uses_native_json_schema_not_forced_tools(llm):
@@ -42,7 +79,8 @@ def test_structured_output_uses_native_json_schema_not_forced_tools(llm):
 
     output_config = payload["output_config"]
     assert output_config["format"]["type"] == "json_schema"
-    assert output_config["effort"] == m.EFFORT          # effort survives the merge
+    if m.EFFORT is not None:
+        assert output_config["effort"] == m.EFFORT      # effort survives the merge
     assert payload.get("tool_choice") is None           # never forced tool calling
     assert "temperature" not in payload
 
