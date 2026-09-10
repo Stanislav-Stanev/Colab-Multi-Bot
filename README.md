@@ -1,4 +1,4 @@
-# 🕵️ Transaction Fraud Analyst — Multi-Agent LangGraph Workflow
+# 🚨 Transaction Fraud Analyst — Multi-Agent LangGraph Workflow
 
 **SoftUni · AI Agents and Workflows for Developers — Individual Project**
 
@@ -13,9 +13,9 @@ A payments company receives natural-language requests such as
 1. **🔎 Fraud Analyst** — fetches the customer's card transactions from the (mock) core banking
    system, runs a deterministic risk-scoring engine, and checks the name against a sanctions
    list. The score and triggered rules come from the engine; the model writes the narrative.
-2. **🧑‍⚖️ Compliance Officer** — turns that assessment into a compliance report and recommends
+2. **📋 Compliance Officer** — turns that assessment into a compliance report and recommends
    exactly one action: **BLOCK / MONITOR / CLEAR**.
-3. **⏸️ Human review** — the graph interrupts. A human can **approve** (action executed),
+3. **⏳ Human review** — the graph interrupts. A human can **approve** (action executed),
    send **feedback** (the officer rewrites the report and the graph asks again), or
    **reject** (action cancelled, report archived).
 

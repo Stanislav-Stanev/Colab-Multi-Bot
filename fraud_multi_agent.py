@@ -1,5 +1,5 @@
 # %% [markdown]
-# # 🕵️ Transaction Fraud Analyst — Multi-Agent LangGraph Workflow
+# # 🚨 Transaction Fraud Analyst — Multi-Agent LangGraph Workflow
 # **SoftUni · AI Agents and Workflows for Developers — Individual Project**
 #
 # ## Scenario
@@ -10,7 +10,7 @@
 #    runs a deterministic risk-scoring engine and a sanctions check, and produces the
 #    risk assessment. The score and the triggered rules come from the engine, not from
 #    the model: an LLM transcribing a number is not a risk decision.
-# 2. **🧑‍⚖️ Compliance Officer** — turns the assessment into a compliance report and
+# 2. **📋 Compliance Officer** — turns the assessment into a compliance report and
 #    recommends an action: **BLOCK / MONITOR / CLEAR**.
 #
 # Blocking a card is a critical action, so the graph **pauses (human-in-the-loop)**
@@ -415,7 +415,7 @@ def fraud_analyst(state: FraudWorkflowState) -> dict:
         if not ai.tool_calls:
             break
         for tc in ai.tool_calls:
-            print(f"   🛠️ tool call: {tc['name']}({json.dumps(tc['args'])[:120]})")
+            print(f"   🔧 tool call: {tc['name']}({json.dumps(tc['args'])[:120]})")
             result = tools_by_name[tc["name"]].invoke(tc["args"])
             evidence.append(f"{tc['name']}({json.dumps(tc['args'])}) -> {result}")
             if tc["name"] == "fetch_customer_transactions":
@@ -470,7 +470,7 @@ def customer_not_found(state: FraudWorkflowState) -> dict:
 def compliance_officer(state: FraudWorkflowState) -> dict:
     revision = state.get("human_decision") or {}
     feedback = revision.get("feedback") if revision.get("type") == "feedback" else None
-    print("🧑‍⚖️ Compliance Officer:", "revising report after human feedback..." if feedback
+    print("📋 Compliance Officer:", "revising report after human feedback..." if feedback
           else "drafting report...")
     content = (f"Fraud analyst assessment (JSON): {json.dumps(state['risk_assessment'])}\n"
                f"Customer: {state.get('customer_id')}")
@@ -504,7 +504,7 @@ def human_review(state: FraudWorkflowState) -> dict:
         "recommended_action": state["recommended_action"],
         "risk_score": (state.get("risk_assessment") or {}).get("risk_score"),
     })
-    print(f"▶️ human_review: resumed with decision={decision}")
+    print(f"🔄 human_review: resumed with decision={decision}")
     return {"human_decision": decision,
             "messages": [HumanMessage(content=f"[Human reviewer] {json.dumps(decision)}")]}
 
@@ -649,7 +649,7 @@ def resume_workflow(thread_id: str, decision: dict) -> dict:
 def show_for_review(payload: dict) -> None:
     """Print the paused report the way a human reviewer needs to see it."""
     print("\n" + "-" * 88)
-    print(f"⏸️ GRAPH INTERRUPTED — awaiting human review "
+    print(f"⏳ GRAPH INTERRUPTED — awaiting human review "
           f"(recommended: {payload['recommended_action']}, risk score: {payload['risk_score']})")
     print("-" * 88)
     print(payload["report"])

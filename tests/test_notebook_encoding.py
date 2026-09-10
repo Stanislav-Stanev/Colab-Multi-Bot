@@ -41,6 +41,26 @@ def test_notebook_kept_its_emoji(notebook_text):
     assert len(EMOJI.findall(notebook_text)) >= 15, "emoji were lost in generation"
 
 
+@pytest.mark.parametrize("path", [SOURCE, NOTEBOOK, ROOT / "README.md"],
+                         ids=["source", "notebook", "readme"])
+def test_no_composite_emoji_sequences(path):
+    """Only single-codepoint emoji.
+
+    A zero-width joiner (U+200D) or variation selector (U+FE0F) renders as one glyph only
+    if the reader's font ships that exact composition; otherwise they see the pieces, an
+    empty box, or a stray invisible character.
+    """
+    if not path.exists():
+        pytest.skip(f"{path.name} has not been generated yet")
+    text = path.read_text(encoding="utf-8")
+    assert "‍" not in text, f"{path.name} has a zero-width joiner emoji sequence"
+    assert "️" not in text, f"{path.name} has a variation-selector emoji sequence"
+
+
+def test_no_replacement_characters(notebook_text):
+    assert "�" not in notebook_text, "notebook contains U+FFFD — characters were lost"
+
+
 def test_notebook_is_valid_and_matches_the_source(notebook_text):
     nb = json.loads(notebook_text)
     assert nb["metadata"]["kernelspec"]["name"] == "python3"
