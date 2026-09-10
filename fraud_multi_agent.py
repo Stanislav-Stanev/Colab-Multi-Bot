@@ -7,8 +7,9 @@
 # for suspicious activity."* Two AI agents collaborate:
 #
 # 1. **🔎 Fraud Analyst** — pulls the customer's transactions (mock core-banking API),
-#    runs a deterministic risk-scoring engine and a sanctions check, and produces a
-#    structured risk assessment.
+#    runs a deterministic risk-scoring engine and a sanctions check, and produces the
+#    risk assessment. The score and the triggered rules come from the engine, not from
+#    the model: an LLM transcribing a number is not a risk decision.
 # 2. **🧑‍⚖️ Compliance Officer** — turns the assessment into a compliance report and
 #    recommends an action: **BLOCK / MONITOR / CLEAR**.
 #
@@ -25,14 +26,16 @@
 # | ≥ 2 distinct agents | `fraud_analyst`, `compliance_officer` (sections 4) |
 # | Defined shared state | `FraudWorkflowState` (section 3) |
 # | ≥ 2 tools | 3 custom tools (section 2) |
-# | Conversational memory | `MemorySaver` + `thread_id` (sections 6, 8/Test 6) |
+# | Conversational memory | `MemorySaver` + `thread_id` (sections 6, 8/Test 7) |
 # | Human-in-the-loop | `interrupt()` in `human_review` (section 5) |
-# | `execute_workflow(user_request)` | Section 7 |
-# | ≥ 5 test cases | 6 scenarios (section 8) |
+# | `execute_workflow(user_request)` | Section 7 — owns the pause/decide/resume loop |
+# | ≥ 5 test cases | 7 scenarios (section 8): approve, feedback→revise, reject, error, memory |
 # | No API keys in code | `get_secret()` (section 1) |
 
 # %%
-# %pip install -qU langgraph langchain langchain-anthropic python-dotenv
+# Versions are pinned to the majors this notebook was validated against: `json_schema`
+# structured output needs langchain-anthropic >= 1.7, and the 1.x majors are recent.
+# %pip install -qU "langgraph>=1.2,<2" "langchain>=1.4,<2" "langchain-anthropic>=1.7,<2" python-dotenv
 
 # %% [markdown]
 # ## 1. Configuration & secrets
@@ -41,6 +44,12 @@
 
 # %%
 import os
+import sys
+
+try:                                    # the agent traces use emoji; Windows consoles
+    sys.stdout.reconfigure(encoding="utf-8")   # still default to a legacy code page
+except (AttributeError, ValueError):
+    pass
 
 MODEL_NAME = "claude-opus-5"    # swap to "claude-sonnet-5" for a cheaper run
 EFFORT = "medium"               # reasoning effort: low | medium | high | xhigh | max
@@ -199,7 +208,7 @@ def _score(transactions: list) -> dict:
     # velocity: >=5 transactions inside any 10-minute window
     for i in range(len(times)):
         if sum(1 for t2 in times if 0 <= (t2 - times[i]).total_seconds() <= 600) >= 5:
-            rules.append("velocity"); score += 30
+            rules.append("velocity"); score += 40
             break
     # geo anomaly: >=3 countries within the observed period
     if len({t["country"] for t in txs}) >= 3:
@@ -273,6 +282,7 @@ from langgraph.types import interrupt, Command
 class FraudWorkflowState(TypedDict):
     user_request: str
     customer_id: Optional[str]
+    customer_found: Optional[bool]
     transactions: list
     risk_assessment: Optional[dict]
     report: Optional[str]
@@ -283,11 +293,13 @@ class FraudWorkflowState(TypedDict):
     messages: Annotated[list, add_messages]
 
 
-class RiskAssessment(BaseModel):
-    """Structured output of the Fraud Analyst agent."""
-    risk_score: int = Field(ge=0, le=100)
-    triggered_rules: list[str]
-    sanctions_match: bool
+class AnalystNarrative(BaseModel):
+    """Structured output of the Fraud Analyst agent.
+
+    Deliberately excludes the risk score and the triggered rules: those come from the
+    scoring engine, so the number that drives the decision is computed, not generated.
+    """
+    sanctions_match: bool = Field(description="True only if the sanctions tool returned a match")
     analyst_notes: str = Field(description="2-4 sentences explaining the patterns found")
 
 
@@ -321,22 +333,32 @@ You may deviate from these bands only with explicit justification."""
 
 
 def _extract_customer_id(text: str) -> Optional[str]:
-    match = re.search(r"cust-\d+", text, re.IGNORECASE)
-    return match.group(0).upper() if match else None
+    """Pull a customer id out of free text: CUST-1042, cust 1042, CUST1042."""
+    match = re.search(r"cust[-\s]?(\d+)", text, re.IGNORECASE)
+    return f"CUST-{match.group(1)}" if match else None
 
 
 def intake(state: FraudWorkflowState) -> dict:
     cid = _extract_customer_id(state["user_request"])
     print(f"📥 intake: request={state['user_request']!r} → customer_id={cid}")
-    return {"customer_id": cid, "revision_count": state.get("revision_count") or 0,
+    if not cid:
+        return {"customer_id": None,
+                "messages": [HumanMessage(content=state["user_request"])]}
+    # A new investigation on this thread: clear the previous case so a stale report,
+    # score or revision budget can never leak into it.
+    return {"customer_id": cid, "revision_count": 0, "transactions": [],
+            "customer_found": None, "risk_assessment": None, "report": None,
+            "recommended_action": None, "human_decision": None, "final_output": None,
             "messages": [HumanMessage(content=state["user_request"])]}
 
 
 def route_after_intake(state) -> str:
-    # No customer id but existing history -> it's a follow-up question over memory.
-    if not state.get("customer_id") and state.get("messages"):
-        return "followup_qa"
-    return "fraud_analyst"
+    """A request naming a customer starts an investigation; anything else on a thread
+    that already holds a conversation is a follow-up answered from memory."""
+    if state.get("customer_id"):
+        return "fraud_analyst"
+    # `intake` has already appended this request, so prior history means len > 1.
+    return "followup_qa" if len(state.get("messages") or []) > 1 else "no_customer"
 
 
 def fraud_analyst(state: FraudWorkflowState) -> dict:
@@ -345,7 +367,7 @@ def fraud_analyst(state: FraudWorkflowState) -> dict:
     msgs = [SystemMessage(content=FRAUD_ANALYST_PROMPT),
             HumanMessage(content=state["user_request"])]
     tools_by_name = {t.name: t for t in TOOLS}
-    transactions, evidence = [], []
+    transactions, evidence, found = [], [], None
     for _ in range(6):                                   # bounded ReAct loop
         ai = llm.invoke(msgs)
         msgs.append(ai)
@@ -356,26 +378,52 @@ def fraud_analyst(state: FraudWorkflowState) -> dict:
             result = tools_by_name[tc["name"]].invoke(tc["args"])
             evidence.append(f"{tc['name']}({json.dumps(tc['args'])}) -> {result}")
             if tc["name"] == "fetch_customer_transactions":
-                transactions = json.loads(result).get("transactions", [])
+                fetched = json.loads(result)
+                found = "error" not in fetched
+                transactions = fetched.get("transactions", [])
             msgs.append(ToolMessage(content=result, tool_call_id=tc["id"]))
 
     # Summarise the tool evidence as plain text: the structured-output call then runs on a
     # clean context, instead of replaying tool_use blocks the schema-only request can't resolve.
     summary = "\n".join(evidence) or "No tool evidence was collected."
-    assessment = structured(RiskAssessment).invoke([
+    narrative = structured(AnalystNarrative).invoke([
         SystemMessage(content=FRAUD_ANALYST_PROMPT),
         HumanMessage(content=f"Original request: {state['user_request']}\n\n"
                              f"Tool evidence collected:\n{summary}\n\n"
-                             f"Produce your final structured risk assessment based strictly "
-                             f"on this evidence. If the customer was not found, set the score "
-                             f"to 0 and say so in the notes."),
+                             f"Explain what the evidence shows. If the customer was not found, "
+                             f"say so plainly."),
     ])
-    print(f"   ✅ assessment: score={assessment.risk_score}, rules={assessment.triggered_rules}, "
-          f"sanctions={assessment.sanctions_match}")
+
+    # The score and the rules are whatever the engine computed, never what the model wrote:
+    # an LLM transcribing a number is not a risk decision. The model contributes the prose.
+    scored = _score(transactions)
+    assessment = {"risk_score": scored["risk_score"],
+                  "triggered_rules": scored["triggered_rules"],
+                  "sanctions_match": narrative.sanctions_match,
+                  "analyst_notes": narrative.analyst_notes}
+    print(f"   ✅ assessment: score={assessment['risk_score']}, "
+          f"rules={assessment['triggered_rules']}, sanctions={assessment['sanctions_match']}")
     return {"transactions": transactions,
-            "risk_assessment": assessment.model_dump(),
-            "messages": [AIMessage(content=f"[Fraud Analyst] {assessment.analyst_notes} "
-                                           f"(score {assessment.risk_score}/100)")]}
+            "customer_found": bool(found),
+            "risk_assessment": assessment,
+            "messages": [AIMessage(content=f"[Fraud Analyst] {narrative.analyst_notes} "
+                                           f"(score {assessment['risk_score']}/100)")]}
+
+
+def route_after_analysis(state) -> str:
+    """No customer record means there is nothing to review and nothing to block —
+    stop here instead of asking a human to approve action on a phantom account."""
+    return "compliance_officer" if state.get("customer_found") else "customer_not_found"
+
+
+def customer_not_found(state: FraudWorkflowState) -> dict:
+    notes = (state.get("risk_assessment") or {}).get("analyst_notes", "")
+    out = (f"REVIEW NOT POSSIBLE: no record for {state.get('customer_id')} in the core "
+           f"banking system, so there is no activity to assess and no action to take.\n\n"
+           f"Analyst: {notes}\n"
+           f"Known customers: {', '.join(sorted(CUSTOMER_DB))}.")
+    print(f"🚧 customer_not_found: {state.get('customer_id')} does not exist — stopping")
+    return {"final_output": out, "messages": [AIMessage(content=out)]}
 
 
 def compliance_officer(state: FraudWorkflowState) -> dict:
@@ -406,7 +454,8 @@ def compliance_officer(state: FraudWorkflowState) -> dict:
 
 # %%
 def human_review(state: FraudWorkflowState) -> dict:
-    print("⏸️ human_review: pausing for human approval...")
+    # Nothing is printed before interrupt(): the node re-runs from the top when the graph
+    # resumes, so anything above this line would appear twice in the transcript.
     decision = interrupt({
         "question": "Review the compliance report. Reply with one of: "
                     "{'type':'approve'} | {'type':'feedback','feedback':'...'} | {'type':'reject'}",
@@ -450,40 +499,61 @@ def cancel_action(state: FraudWorkflowState) -> dict:
     return {"final_output": out, "messages": [AIMessage(content=out)]}
 
 
+def no_customer(state: FraudWorkflowState) -> dict:
+    """Nothing to investigate and no history to answer from — say so, spend no tokens."""
+    out = ("I could not find a customer id in that request. Please include one, "
+           f"for example: 'Review CUST-1042 for suspicious activity.' "
+           f"Known customers: {', '.join(sorted(CUSTOMER_DB))}.")
+    print("❓ no_customer: no customer id in the request")
+    return {"final_output": out, "messages": [AIMessage(content=out)]}
+
+
 def followup_qa(state: FraudWorkflowState) -> dict:
     print("💬 followup_qa: answering from conversation memory...")
     answer = get_llm().invoke(
         [SystemMessage(content="Answer the user's follow-up question strictly from the "
                                "conversation history of this fraud-review thread.")]
         + state["messages"])
-    return {"final_output": answer.content, "messages": [answer]}
+    # `.content` is a list of blocks (thinking, text, ...) on the Claude 5 models; `.text`
+    # is the concatenated text, which is what a human wants to read.
+    return {"final_output": answer.text, "messages": [answer]}
 
 # %% [markdown]
 # ## 6. Assembling the LangGraph
 # ```
 # intake ──► fraud_analyst ──► compliance_officer ──► human_review ──► execute_action ► END
-#    │                                  ▲                  │ feedback        │reject
-#    └──► followup_qa ► END             └──────────────────┤                 ▼
-#                                                          └──────────► cancel_action ► END
+#    │             │                    ▲                  │ feedback        │ reject
+#    │             │                    └──────────────────┤                 ▼
+#    │             │                                       └────────► cancel_action ► END
+#    │             └─ customer not in the system ─► customer_not_found ─► END
+#    ├─ no customer id, prior history ─► followup_qa ─► END
+#    └─ no customer id, fresh thread  ─► no_customer ─► END
 # ```
+# Two of those branches exist so the graph never reaches a critical action it cannot justify:
+# a request naming nobody, and a customer the core banking system has never heard of.
 
 # %%
 _builder = StateGraph(FraudWorkflowState)
 for _name, _fn in [("intake", intake), ("fraud_analyst", fraud_analyst),
                    ("compliance_officer", compliance_officer), ("human_review", human_review),
                    ("execute_action", execute_action), ("cancel_action", cancel_action),
-                   ("followup_qa", followup_qa)]:
+                   ("followup_qa", followup_qa), ("no_customer", no_customer),
+                   ("customer_not_found", customer_not_found)]:
     _builder.add_node(_name, _fn)
 _builder.add_edge(START, "intake")
 _builder.add_conditional_edges("intake", route_after_intake,
-                               {"fraud_analyst": "fraud_analyst", "followup_qa": "followup_qa"})
-_builder.add_edge("fraud_analyst", "compliance_officer")
+                               {"fraud_analyst": "fraud_analyst", "followup_qa": "followup_qa",
+                                "no_customer": "no_customer"})
+_builder.add_conditional_edges("fraud_analyst", route_after_analysis,
+                               {"compliance_officer": "compliance_officer",
+                                "customer_not_found": "customer_not_found"})
 _builder.add_edge("compliance_officer", "human_review")
 _builder.add_conditional_edges("human_review", route_after_review,
                                {"execute_action": "execute_action",
                                 "compliance_officer": "compliance_officer",
                                 "cancel_action": "cancel_action"})
-for _terminal in ("execute_action", "cancel_action", "followup_qa"):
+for _terminal in ("execute_action", "cancel_action", "followup_qa", "no_customer",
+                  "customer_not_found"):
     _builder.add_edge(_terminal, END)
 
 checkpointer = MemorySaver()                       # conversational memory (requirement)
@@ -491,11 +561,15 @@ graph = _builder.compile(checkpointer=checkpointer)
 
 # %%
 if not SKIP_DEMOS:
-    from IPython.display import Image, display
     try:
+        from IPython.display import Image, display
         display(Image(graph.get_graph().draw_mermaid_png()))
-    except Exception:
-        print(graph.get_graph().draw_ascii())      # offline fallback
+    except Exception as exc:
+        # draw_mermaid_png() calls mermaid.ink and can fail on a flaky network. Fall back
+        # to the mermaid source, which needs no network and no extra package, so a bad
+        # render can never abort "Run all".
+        print(f"(diagram render unavailable: {type(exc).__name__}) — mermaid source:\n")
+        print(graph.get_graph().draw_mermaid())
 
 # %% [markdown]
 # ## 7. Core function: `execute_workflow` (+ resume helper)
@@ -516,48 +590,81 @@ def _result_of(raw: dict, thread_id: str) -> dict:
             "final_output": raw.get("final_output")}
 
 
-def execute_workflow(user_request: str, thread_id: Optional[str] = None) -> dict:
-    """Start the fraud-review workflow for a natural-language request.
-    Runs until the graph pauses for human review or finishes."""
+def start_workflow(user_request: str, thread_id: Optional[str] = None) -> dict:
+    """Low-level: run the graph until it pauses for human review (or finishes)."""
     thread_id = thread_id or f"thread-{uuid.uuid4().hex[:8]}"
     config = {"configurable": {"thread_id": thread_id}}
-    raw = graph.invoke({"user_request": user_request}, config=config)
-    return _result_of(raw, thread_id)
+    return _result_of(graph.invoke({"user_request": user_request}, config=config), thread_id)
 
 
 def resume_workflow(thread_id: str, decision: dict) -> dict:
-    """Resume an interrupted workflow with the human decision:
+    """Low-level: resume a paused workflow with the human decision:
     {'type':'approve'} | {'type':'feedback','feedback':'...'} | {'type':'reject'}"""
     config = {"configurable": {"thread_id": thread_id}}
     raw = graph.invoke(Command(resume=decision), config=config)
     return _result_of(raw, thread_id)
 
 
-def run_scenario(title: str, user_request: str, decisions: list,
-                 thread_id: Optional[str] = None) -> dict:
-    """Demo driver: executes a workflow and feeds scripted human decisions in order,
-    printing everything a reviewer needs to see the HITL process."""
-    print("=" * 88); print(f"🧪 {title}"); print(f"USER REQUEST: {user_request}"); print("=" * 88)
-    result = execute_workflow(user_request, thread_id=thread_id)
-    step = 0
+def show_for_review(payload: dict) -> None:
+    """Print the paused report the way a human reviewer needs to see it."""
+    print("\n" + "-" * 88)
+    print(f"⏸️ GRAPH INTERRUPTED — awaiting human review "
+          f"(recommended: {payload['recommended_action']}, risk score: {payload['risk_score']})")
+    print("-" * 88)
+    print(payload["report"])
+
+
+def ask_human(payload: dict) -> dict:
+    """Ask the operator what to do. Works in Colab and in a local terminal."""
+    show_for_review(payload)
+    answer = input("\n🧑 Approve / Reject / or type feedback to revise > ").strip()
+    if answer.lower() in ("", "a", "y", "yes", "approve", "approved"):
+        return {"type": "approve"}
+    if answer.lower() in ("r", "n", "no", "reject", "rejected"):
+        return {"type": "reject"}
+    return {"type": "feedback", "feedback": answer}
+
+
+def execute_workflow(user_request: str, *, decisions: Optional[list] = None,
+                     thread_id: Optional[str] = None) -> dict:
+    """Run the complete fraud-review workflow for one natural-language request.
+
+    This is the assignment's core entry point: it initializes the graph, handles every
+    human-in-the-loop interruption, collects the human's decision, resumes the graph
+    with it, and returns the final output.
+
+    The human is asked interactively via `input()`. Pass `decisions` (a list of
+    decision dicts) to script the answers instead, so the notebook's test cases run
+    reproducibly from top to bottom; `thread_id` continues an existing conversation.
+    """
+    result = start_workflow(user_request, thread_id=thread_id)
+    scripted = list(decisions or [])
+
     while result["status"] == "awaiting_human_review":
-        payload = result["interrupt_payload"]
-        print("\n" + "-" * 88)
-        print(f"⏸️ GRAPH INTERRUPTED — report for human review "
-              f"(recommended: {payload['recommended_action']}, score: {payload['risk_score']}):")
-        print(payload["report"])
-        decision = decisions[step] if step < len(decisions) else {"type": "approve"}
-        step += 1
-        print(f"\n🧑 HUMAN DECISION: {decision}")
-        print("-" * 88)
+        if scripted:
+            decision = scripted.pop(0)
+            show_for_review(result["interrupt_payload"])
+            print(f"\n🧑 HUMAN DECISION (scripted): {decision}")
+        else:
+            decision = ask_human(result["interrupt_payload"])
         result = resume_workflow(result["thread_id"], decision)
+
+    return result
+
+
+def run_scenario(title: str, user_request: str, decisions: Optional[list] = None,
+                 thread_id: Optional[str] = None) -> dict:
+    """Demo wrapper: banner + `execute_workflow` + final output, for the test cases."""
+    print("=" * 88); print(f"🧪 {title}"); print(f"USER REQUEST: {user_request}"); print("=" * 88)
+    result = execute_workflow(user_request, decisions=decisions, thread_id=thread_id)
     print("\n🏁 FINAL OUTPUT:\n" + (result.get("final_output") or "(none)"))
     return result
 
 # %% [markdown]
 # ## 8. Test cases (≥ 5, incl. approve / feedback-revision / reject / error / memory)
-# Each cell runs one scenario. `run_scenario` scripts the human decisions so the whole
-# notebook executes reproducibly; in a live setting a human would type the decision.
+# Each cell runs one scenario. The `decisions` list scripts the human's answers so the
+# whole notebook executes reproducibly from top to bottom. Call `execute_workflow(request)`
+# **without** `decisions` and it prompts the reviewer interactively with `input()` instead.
 
 # %% [markdown]
 # ### Test 1 — Clean customer → CLEAR, human approves
@@ -579,15 +686,18 @@ if not SKIP_DEMOS:
 
 # %% [markdown]
 # ### Test 3 — Velocity fraud → human sends FEEDBACK → report revised → approve
+# CUST-1337 scores 40/100 (velocity only), so the officer lands on MONITOR. The reviewer
+# judges that too lenient and asks for an escalation — the revision loop in action.
 
 # %%
 if not SKIP_DEMOS:
     t3 = run_scenario("Test 3: velocity pattern (feedback → revision → approve)",
                       "Check CUST-1337, the terminal reported many rapid payments.",
                       decisions=[{"type": "feedback",
-                                  "feedback": "Blocking is too aggressive for a first incident. "
-                                              "Recommend MONITOR and describe what would escalate "
-                                              "it to BLOCK."},
+                                  "feedback": "Monitoring is too lenient here: six payments at "
+                                              "the same merchants inside eight minutes is a "
+                                              "classic velocity attack. Escalate to BLOCK and "
+                                              "state the evidence that justifies it."},
                                  {"type": "approve"}])
 
 # %% [markdown]
@@ -601,23 +711,35 @@ if not SKIP_DEMOS:
 
 # %% [markdown]
 # ### Test 5 — Unknown customer → graceful error handling
+# The analyst's tool returns an error, so the graph stops at `customer_not_found`. It never
+# reaches the compliance report or the human gate: there is no account to block.
 
 # %%
 if not SKIP_DEMOS:
-    t5 = run_scenario("Test 5: unknown customer (error path)",
-                      "Please check CUST-9999 for suspicious transactions.",
+    t5 = run_scenario("Test 5: unknown customer (error path, no HITL needed)",
+                      "Please check CUST-9999 for suspicious transactions.")
+
+# %% [markdown]
+# ### Test 6 — Sanctions hit → BLOCK for a reason the score alone would miss
+# CUST-4444 has only two quiet transactions (score 15), but the name is on the watch list,
+# so the officer's rules make it an unconditional BLOCK.
+
+# %%
+if not SKIP_DEMOS:
+    t6 = run_scenario("Test 6: sanctions match (approve block)",
+                      "Compliance flagged CUST-4444 — please run a review.",
                       decisions=[{"type": "approve"}])
 
 # %% [markdown]
-# ### Test 6 — Conversational memory: follow-up question in the same thread
+# ### Test 7 — Conversational memory: follow-up question in the same thread
 # We reuse Test 2's `thread_id`; `MemorySaver` restores the whole conversation, and the
 # graph routes a request without a customer id to the `followup_qa` node.
 
 # %%
 if not SKIP_DEMOS:
-    t6 = execute_workflow("What was the final risk score and which rules were triggered?",
+    t7 = execute_workflow("What was the final risk score and which rules were triggered?",
                           thread_id=t2["thread_id"])
-    print("💬 Memory-based answer:\n", t6["final_output"])
+    print("💬 Memory-based answer:\n", t7["final_output"])
 
 # %% [markdown]
 # ## 9. Conclusion

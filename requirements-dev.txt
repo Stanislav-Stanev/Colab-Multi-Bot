@@ -1,6 +1,8 @@
-langgraph>=0.4
-langchain>=0.3
-langchain-anthropic>=0.3
+# Pinned to the majors the notebook was validated against. langchain-anthropic < 1.7
+# has no `json_schema` structured-output method and every agent node would fail.
+langgraph>=1.2,<2
+langchain>=1.4,<2
+langchain-anthropic>=1.7,<2
 python-dotenv
 jupytext
 pytest

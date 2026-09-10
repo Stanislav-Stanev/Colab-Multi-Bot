@@ -55,8 +55,14 @@ class Script:
         self.followup_calls = []
 
     def next_chat(self, messages):
-        # First chat call = analyst asking for tools; second = analyst wrap-up.
-        if not self.tool_round_done:
+        # followup_qa is the only caller whose prompt mentions a follow-up question.
+        if any("follow-up" in getattr(msg, "content", "") for msg in messages
+               if isinstance(getattr(msg, "content", ""), str)):
+            self.followup_calls.append(messages)
+            return AIMessage(content="Recalled from memory: score 85, rules card_testing.")
+        # The analyst asks for the tools until their results are in, then wraps up. Keyed on
+        # the messages rather than a flag, so several runs can share one script.
+        if not any(getattr(msg, "type", "") == "tool" for msg in messages):
             self.tool_round_done = True
             return AIMessage(content="", tool_calls=[
                 {"name": "fetch_customer_transactions",
@@ -64,20 +70,12 @@ class Script:
                 {"name": "check_sanctions_list",
                  "args": {"customer_name": "Someone"}, "id": "tc2", "type": "tool_call"},
             ])
-        # A chat call with no pending tool work is either the analyst's summary or followup_qa.
-        if any("follow-up" in getattr(msg, "content", "") for msg in messages
-               if isinstance(getattr(msg, "content", ""), str)):
-            self.followup_calls.append(messages)
-            return AIMessage(content="Recalled from memory: score 85, rules card_testing.")
         return AIMessage(content="Investigation complete.")
 
     def next_structured(self, schema, messages):
-        if schema is m.RiskAssessment:
+        if schema is m.AnalystNarrative:
             self.assessment_calls.append(messages)
-            scored = m._score(m._fetch(self.customer_id).get("transactions", []))
-            return m.RiskAssessment(
-                risk_score=scored["risk_score"],
-                triggered_rules=scored["triggered_rules"],
+            return m.AnalystNarrative(
                 sanctions_match=False,
                 analyst_notes="Scripted analyst notes.")
         if schema is m.ComplianceReport:
@@ -106,7 +104,7 @@ def _thread():
 
 def test_approve_path_executes_block(scripted):
     scripted("CUST-1042", "BLOCK")
-    started = m.execute_workflow("Investigate CUST-1042 for fraud.", thread_id=_thread())
+    started = m.start_workflow("Investigate CUST-1042 for fraud.", thread_id=_thread())
 
     assert started["status"] == "awaiting_human_review"
     payload = started["interrupt_payload"]
@@ -122,7 +120,7 @@ def test_approve_path_executes_block(scripted):
 
 def test_reject_path_cancels_action(scripted):
     scripted("CUST-2077", "BLOCK")
-    started = m.execute_workflow("Fraud review for CUST-2077.", thread_id=_thread())
+    started = m.start_workflow("Fraud review for CUST-2077.", thread_id=_thread())
     done = m.resume_workflow(started["thread_id"], {"type": "reject"})
 
     assert "CANCELLED" in done["final_output"]
@@ -131,7 +129,7 @@ def test_reject_path_cancels_action(scripted):
 
 def test_feedback_path_revises_report_then_approves(scripted):
     script = scripted("CUST-1337", "BLOCK")
-    started = m.execute_workflow("Check CUST-1337 rapid payments.", thread_id=_thread())
+    started = m.start_workflow("Check CUST-1337 rapid payments.", thread_id=_thread())
     assert "Compliance report v1" in started["interrupt_payload"]["report"]
 
     revised = m.resume_workflow(started["thread_id"],
@@ -148,21 +146,32 @@ def test_feedback_path_revises_report_then_approves(scripted):
     assert "monitoring" in done["final_output"].lower()
 
 
-def test_unknown_customer_still_completes(scripted):
+def test_unknown_customer_stops_before_any_action(scripted):
+    """No account means no report and no human gate — there is nothing to approve."""
     scripted("CUST-9999", "CLEAR")
-    started = m.execute_workflow("Please check CUST-9999.", thread_id=_thread())
-    done = m.resume_workflow(started["thread_id"], {"type": "approve"})
-    assert done["status"] == "completed"
-    assert started["interrupt_payload"]["risk_score"] == 0
+    result = m.start_workflow("Please check CUST-9999.", thread_id=_thread())
+
+    assert result["status"] == "completed"          # never pauses for a human
+    assert "REVIEW NOT POSSIBLE" in result["final_output"]
+    assert "CUST-9999" in result["final_output"]
+    assert "BLOCKED" not in result["final_output"]
+
+
+def test_known_customer_is_marked_found(scripted):
+    scripted("CUST-1001", "CLEAR")
+    thread = _thread()
+    m.start_workflow("Review CUST-1001.", thread_id=thread)
+    state = m.graph.get_state({"configurable": {"thread_id": thread}})
+    assert state.values["customer_found"] is True
 
 
 def test_memory_followup_uses_same_thread(scripted):
     script = scripted("CUST-1042", "BLOCK")
     thread = _thread()
-    started = m.execute_workflow("Investigate CUST-1042.", thread_id=thread)
+    started = m.start_workflow("Investigate CUST-1042.", thread_id=thread)
     m.resume_workflow(thread, {"type": "approve"})
 
-    followup = m.execute_workflow("What was the final risk score again?", thread_id=thread)
+    followup = m.start_workflow("What was the final risk score again?", thread_id=thread)
     assert followup["status"] == "completed"
     assert "Recalled from memory" in followup["final_output"]
 
@@ -174,8 +183,8 @@ def test_memory_followup_uses_same_thread(scripted):
 
 def test_threads_are_isolated(scripted):
     scripted("CUST-1001", "CLEAR")
-    a = m.execute_workflow("Review CUST-1001.", thread_id=_thread())
-    b = m.execute_workflow("Review CUST-1001.", thread_id=_thread())
+    a = m.start_workflow("Review CUST-1001.", thread_id=_thread())
+    b = m.start_workflow("Review CUST-1001.", thread_id=_thread())
     assert a["thread_id"] != b["thread_id"]
     m.resume_workflow(a["thread_id"], {"type": "approve"})
     # thread b is still paused and resumable independently
@@ -186,7 +195,7 @@ def test_threads_are_isolated(scripted):
 def test_analyst_really_invokes_tools(scripted):
     script = scripted("CUST-1042", "BLOCK")
     thread = _thread()
-    m.execute_workflow("Investigate CUST-1042.", thread_id=thread)
+    m.start_workflow("Investigate CUST-1042.", thread_id=thread)
 
     # transactions came back through the tool and were stored in the shared state
     state = m.graph.get_state({"configurable": {"thread_id": thread}})
@@ -202,7 +211,7 @@ def test_analyst_really_invokes_tools(scripted):
 def test_revision_budget_forces_finalisation(scripted):
     scripted("CUST-1337", "BLOCK")
     thread = _thread()
-    result = m.execute_workflow("Check CUST-1337.", thread_id=thread)
+    result = m.start_workflow("Check CUST-1337.", thread_id=thread)
     for _ in range(m.MAX_REVISIONS):
         assert result["status"] == "awaiting_human_review"
         result = m.resume_workflow(thread, {"type": "feedback", "feedback": "again please"})

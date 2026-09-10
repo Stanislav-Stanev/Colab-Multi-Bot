@@ -36,7 +36,7 @@ def test_model_and_effort(llm):
 
 
 def test_structured_output_uses_native_json_schema_not_forced_tools(llm):
-    bound = m.structured(m.RiskAssessment)
+    bound = m.structured(m.AnalystNarrative)
     inner = getattr(bound, "first", bound)
     payload = llm._get_request_payload(MESSAGES, **getattr(inner, "kwargs", {}))
 

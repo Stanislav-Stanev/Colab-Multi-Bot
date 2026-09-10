@@ -12,7 +12,7 @@ A payments company receives natural-language requests such as
 
 1. **🔎 Fraud Analyst** — fetches the customer's card transactions from the (mock) core banking
    system, runs a deterministic risk-scoring engine, and checks the name against a sanctions
-   list. Emits a structured `RiskAssessment` (score 0–100, triggered rules, analyst notes).
+   list. The score and triggered rules come from the engine; the model writes the narrative.
 2. **🧑‍⚖️ Compliance Officer** — turns that assessment into a compliance report and recommends
    exactly one action: **BLOCK / MONITOR / CLEAR**.
 3. **⏸️ Human review** — the graph interrupts. A human can **approve** (action executed),
@@ -27,7 +27,8 @@ A payments company receives natural-language requests such as
 START ─► intake ─► fraud_analyst ─► compliance_officer ─► human_review ─ approve ─► execute_action ─► END
            │                                              (interrupt) │
            │                                                          └─ reject ──► cancel_action ──► END
-           └─ no customer id + prior history ─► followup_qa ─► END
+           ├─ no customer id, prior history ─► followup_qa  ─► END
+           └─ no customer id, fresh thread  ─► no_customer  ─► END
 ```
 
 * **State:** `FraudWorkflowState` (`TypedDict`) carries the request, customer id, transactions,
@@ -36,7 +37,12 @@ START ─► intake ─► fraud_analyst ─► compliance_officer ─► human_
 * **Memory:** `MemorySaver` checkpointer keyed by `thread_id` — follow-up questions in the same
   thread are answered from the checkpointed conversation (`followup_qa` node).
 * **HITL:** `interrupt()` inside `human_review`, resumed with `Command(resume=decision)`.
+  `execute_workflow` owns that loop: it pauses, collects the decision, resumes, and repeats
+  until the graph produces a final output.
 * **Revision guard:** at most `MAX_REVISIONS = 3` feedback rounds, then the action is finalised.
+* **The score is computed, not generated.** `fraud_analyst` writes `_score()`'s output into
+  the state and lets the model contribute only the narrative, so the number that drives
+  BLOCK / MONITOR / CLEAR can never be an LLM transcription error.
 
 ## Tools (3 custom tools)
 
@@ -48,14 +54,28 @@ START ─► intake ─► fraud_analyst ─► compliance_officer ─► human_
 
 ## Test cases (section 8 of the notebook)
 
-| # | Customer | Pattern | Human decision | Demonstrates |
+| # | Customer | Score → recommendation | Human decision | Demonstrates |
 |---|---|---|---|---|
-| 1 | CUST-1001 | clean history | approve | happy path, CLEAR |
-| 2 | CUST-1042 | card testing (micro-payments then a large one) | approve | BLOCK executed |
-| 3 | CUST-1337 | velocity (6 payments in 8 minutes) | **feedback** → approve | report revision loop |
-| 4 | CUST-2077 | geo anomaly + gambling/crypto MCCs | **reject** | action cancelled |
+| 1 | CUST-1001 | 0 → CLEAR | approve | happy path |
+| 2 | CUST-1042 | 100 → BLOCK (card testing) | approve | critical action executed |
+| 3 | CUST-1337 | 40 → MONITOR (velocity) | **feedback** → approve | revision loop, human escalates |
+| 4 | CUST-2077 | 40 → MONITOR (geo + crypto/gambling) | **reject** | action cancelled |
 | 5 | CUST-9999 | unknown customer | approve | graceful error handling |
-| 6 | — | follow-up in Test 2's thread | — | conversational memory |
+| 6 | CUST-4444 | 15, but sanctions hit → BLOCK | approve | a rule overriding the score |
+| 7 | — | follow-up in Test 2's thread | — | conversational memory |
+
+## The core function
+
+```python
+execute_workflow(user_request: str, *, decisions=None, thread_id=None) -> dict
+```
+
+One string in, the final output out. It initializes the graph, and on every human-in-the-loop
+pause it shows the report, collects the reviewer's decision, and resumes the graph with it —
+looping until the workflow completes. By default it asks the reviewer through `input()`;
+the notebook's test cases pass a scripted `decisions` list so the whole notebook runs
+top to bottom unattended. `start_workflow` / `resume_workflow` are the low-level halves
+underneath, if you want to drive the pause yourself.
 
 ## Running it
 
@@ -98,7 +118,7 @@ Two details matter on the Claude 5 family and are handled in the code:
 
 ## Tests
 
-40 unit and integration tests run without an API key — the graph is exercised end to end
+53 unit and integration tests run without an API key — the graph is exercised end to end
 against a scripted fake LLM (real `interrupt()`, real checkpointer, real routing):
 
 ```bash
@@ -118,7 +138,7 @@ python -m jupytext --to ipynb --set-kernel python3 fraud_multi_agent.py -o Fraud
 ```text
 Fraud_Detection_Multi_Agent.ipynb   the submission notebook (generated)
 fraud_multi_agent.py                same code as a VS Code / jupytext script
-tests/                              40 tests (tools, rules, routers, request shape, graph runs)
+tests/                              53 tests (tools, rules, routers, request shape, graph runs)
 .env.example                        template for the local API key
 requirements-dev.txt                dependencies for local development
 docs/superpowers/                   design spec and implementation plan
