@@ -1,5 +1,12 @@
 # Fraud Detection Multi-Agent Workflow — Implementation Plan
 
+> **Historical record — superseded in places.** This document says what was planned on
+> 2026-09-10 and is kept unedited for that reason. The code has since moved on: the
+> RevolutBank rebrand added a triage and a comms agent, and the harness-engineering
+> review ([`hareness_improvment.md`](../../../hareness_improvment.md)) changed the tool
+> signatures, the analyst's tool kit, the revision-exhaustion route and the audit format.
+> For current behaviour read `fraud_multi_agent.py`, `README.md` and `CLAUDE.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** A Colab + VS Code compatible Jupyter notebook implementing a two-agent LangGraph fraud-detection workflow with custom tools, MemorySaver memory, `interrupt()`-based human-in-the-loop, `execute_workflow()`, and 6 demo test cases.

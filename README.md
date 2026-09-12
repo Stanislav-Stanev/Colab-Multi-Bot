@@ -42,6 +42,9 @@ alerts, chargeback disputes, AML referrals, customer reports:
 
 *"Investigate CUST-1042 — we received a fraud alert from the issuer."*
 
+It has since been reviewed against current agent-harness practice; what that review found
+and what changed is in [hareness_improvment.md](hareness_improvment.md).
+
 | # | Agent | Responsibility |
 |---|---|---|
 | 1 | 📨 **Triage Agent** | Classifies the signal, looks up prior cases, sets the priority, opens the case |
@@ -66,9 +69,10 @@ flowchart TD
     FA -->|record found| CO[📋 compliance_officer]
     CO --> CD[📣 comms_draft]
     CD --> HR{{⏳ human_review · interrupt}}
-    HR -->|feedback| CO
+    HR -->|feedback, budget left| CO
+    HR -->|feedback, budget spent| ES[🔺 escalate] --> E
     HR -->|reject| CA[🛑 cancel_action] --> E
-    HR -->|approve| EA[🏁 execute_action]
+    HR -->|approve / approve+edit| EA[🏁 execute_action]
     EA --> DL[📬 comms_deliver] --> E
 
     classDef agent fill:#e8f0fe,stroke:#4285f4,color:#111
@@ -76,7 +80,7 @@ flowchart TD
     classDef guard fill:#f1f3f4,stroke:#9aa0a6,color:#111
     class T,FA,CO,CD,DL agent
     class HR gate
-    class FQ,NC,CNF,CA,EA guard
+    class FQ,NC,CNF,CA,EA,ES guard
 ```
 
 Blue nodes are agents, amber is the human gate, grey are deterministic guards and terminal
@@ -126,9 +130,19 @@ sequenceDiagram
 |---|---|---|
 | Customer id | regex over the request | a transcription error picks the wrong account |
 | Risk score & rules | `_score()` rule engine | a number an LLM retyped is not a risk decision |
-| Sanctions match | `check_sanctions_list` re-run on the **fetched** name | a live run screened `"CUST-4444"` instead of *Viktor Baranov* and cleared a watch-listed customer |
+| Sanctions match | `check_sanctions_list`, run by the harness on the **fetched** name | a live run screened `"CUST-4444"` instead of *Viktor Baranov* and cleared a watch-listed customer. The tool is not in the analyst's kit at all, so the model cannot choose who gets screened |
 | Priority escalation | a recorded prior BLOCK forces P1 | a past confirmed fraud is a fact, not a judgement |
 | BLOCK on a sanctions hit | deterministic override, annotated in the report | a legal hard stop must not depend on a prompt being followed |
+
+**The gate fails closed.** A revision loop needs a limit — but finalising the action after
+the last round would execute the recommendation the reviewer was still objecting to, an
+approval nobody gave. When the budget runs out, `escalate` stops the case dead: nothing
+executed, nothing sent, parked for a senior reviewer with the draft report intact.
+
+**The reviewer can sign their own words.** Alongside approve / feedback / reject, a
+decision may carry `edited_body`: the action goes ahead and the customer receives exactly
+the text the human typed, with both versions written to the audit trail. It costs no LLM
+round, and it makes "a human approved these words" literally true.
 
 **One gate covers every side effect the customer can see.** `comms_draft` runs *before* the
 interrupt, so the human approves the exact words; `comms_deliver` sits *after*
@@ -136,13 +150,23 @@ interrupt, so the human approves the exact words; `comms_deliver` sits *after*
 approved text verbatim — a model must not be able to rewrite a message a human signed off.
 
 **Tool output is untrusted input.** Merchant descriptors are attacker-controlled in the
-real world, so every tool result reaches the model inside an `UNTRUSTED TOOL OUTPUT` fence.
-`CUST-6006`'s merchant names contain an injected instruction; Test 8 shows it changing
-nothing that matters.
+real world, so every tool result reaches the model inside an `UNTRUSTED TOOL OUTPUT` fence
+whose delimiter carries a **random per-call tag**, and anything fence-shaped inside the
+data is neutralised before it is wrapped. A fixed delimiter is one the attacker can type:
+a merchant name ending the fence and continuing with counterfeit instructions is the exact
+bypass the fence exists to stop. `CUST-6006` hides an instruction aimed at the model and
+`CUST-6007` one aimed at the fence itself; both run on every *Run all*.
 
-**An agent cannot reach past its case.** `run_tool_loop(pin_args=…)` overrides the
-customer id on every tool that declares one, so an agent working CUST-1001 cannot pull
-CUST-1042's case file however it phrases the call.
+**An agent cannot reach past its case, and holds no tool it does not need.**
+`run_tool_loop(pin_args=…)` overrides the customer id on every tool that declares one, so
+an agent working CUST-1001 cannot pull CUST-1042's case file however it phrases the call.
+The analyst's kit is two tools, both pinned; asking for anything else gets a structured
+refusal rather than a crashed investigation.
+
+**A replayed node does not act twice.** LangGraph re-runs a node from its top when a case
+resumes, so every customer-visible effect carries an idempotency key derived from durable
+state (`case_id:notify:revision`). Without it, one approval resumed after a restart means
+two messages to the customer and two deliveries in the audit trail.
 
 **The graph never reaches an action it cannot justify.** Three branches exist for that: a
 signal naming nobody, a customer the core banking system has never heard of, and a rejected
@@ -150,13 +174,16 @@ action whose customer message is suppressed rather than sent.
 
 ## Tools (5 custom tools)
 
-| Tool | What it does |
-|---|---|
-| `fetch_customer_transactions(customer_id)` | Mock RevolutBank Core Banking API over a deterministic synthetic dataset of 7 customer profiles; structured error for unknown ids |
-| `calculate_risk_score(transactions_json)` | Deterministic rule engine: card testing, velocity, geo anomaly, amount outlier, risky MCCs (gambling / crypto / money transfer), night-time activity. Score 0–100 + triggered rules |
-| `check_sanctions_list(customer_name)` | Mock RevolutBank Screening Service (EU consolidated list) |
-| `lookup_case_history(customer_id)` | Mock case-management store: prior fraud cases and their outcomes |
-| `send_customer_notification(...)` | Mock Notification API; validates the channel, records the payload in the audit trail, returns a delivery id |
+| Tool | Called by | What it does |
+|---|---|---|
+| `fetch_customer_transactions(customer_id)` | analyst | Mock RevolutBank Core Banking API over a deterministic synthetic dataset of 8 customer profiles; structured error for unknown ids |
+| `calculate_risk_score(customer_id)` | analyst | Deterministic rule engine: card testing, velocity, geo anomaly, amount outlier, risky MCCs (gambling / crypto / money transfer), night-time activity. Score 0–100 + triggered rules. Takes an **id, not the data** — the figures a decision rests on never make a round trip through the model as a retyped argument |
+| `lookup_case_history(customer_id)` | triage | Mock case-management store: prior fraud cases and their outcomes |
+| `check_sanctions_list(customer_name)` | **the harness** | Mock RevolutBank Screening Service (EU consolidated list). Deliberately not in any agent's kit: the result is only trusted when the harness runs it on the fetched name |
+| `send_customer_notification(...)` | comms node | Mock Notification API; validates the channel, dedupes on an idempotency key, records the payload in the audit trail, returns a delivery id |
+
+Both tools the analyst can reach take a `customer_id`, which is what makes `pin_args` able
+to protect them: whatever the model asks for, the id is overwritten with the case's own.
 
 ## Shared state
 
@@ -169,8 +196,15 @@ message history (`add_messages` reducer).
 
 * **HITL:** `interrupt()` inside `human_review`, resumed with `Command(resume=decision)`.
   `execute_workflow` owns that loop: it pauses, collects the decision, resumes, repeats.
-* **Revision guard:** at most `MAX_REVISIONS = 3` feedback rounds, then the action is
-  finalised — a loop breaker, not a limit on the reviewer.
+  Four decisions are accepted — `approve`, `approve` **with `edited_body`**, `feedback`,
+  `reject` — and an operator driving it by hand types `edit: <text>` for the second.
+* **Revision guard:** at most `MAX_REVISIONS = 3` feedback rounds, then the case is
+  **escalated, not executed** — a loop breaker that fails closed, because the reviewer's
+  last word was an objection.
+* **Gate staleness:** the case records when it reached the gate, so
+  `hours_awaiting_review(case_state(thread_id))` answers "how long has this been sitting
+  here" from the checkpoint alone. Nothing ages a case automatically — that is an SLA
+  timer, and it belongs in the production migration rather than in a notebook.
 * **Memory:** a checkpointer keyed by `thread_id`. Follow-up questions in the same thread
   are answered from the checkpointed conversation (`followup_qa`), which triage recognises
   without spending a token on classification.
@@ -194,6 +228,18 @@ message history (`add_messages` reducer).
 | 8 | CUST-6006 | prompt injection in the data | approve | the injection changes nothing |
 | 9 | CUST-3050 | 20 → MONITOR | approve | durable interrupt: graph rebuilt mid-case |
 
+`CUST-6007` carries the second adversarial profile — an injection aimed at the data fence
+rather than at the model — and is exercised by the offline suite on every commit.
+
+Two evals run on every *Run all*, and either one fails the notebook:
+
+* **8.1 — the rule engine**, scored against a labelled set. No LLM calls, so it is free.
+* **8.1b — the model's own behaviour**, read from the state the scenarios above already
+  produced: did triage classify the issuer alert as `FRAUD_ALERT`, is the reported score
+  still the engine's score (including in the injection case), and did any customer message
+  disclose a rule name, the risk score, or the word "sanctions". Also free — it asserts
+  over runs that already happened.
+
 ## The core function
 
 ```python
@@ -211,18 +257,22 @@ are the low-level halves underneath.
 
 | Practice | How |
 |---|---|
-| **Retries** | exponential backoff with jitter on transient faults (429 / 529 / 5xx / timeouts); permanent errors (400 / 401 / 404) fail fast instead of being retried three times |
+| **Retries** | exponential backoff with jitter on transient faults, classified by the **status code the exception carries** (followed down the `__cause__` chain LangChain wraps it in), not by substring-matching its message — `1500.00 EUR` is not a `500`. Permanent errors (400 / 401 / 404) fail fast. Exactly one layer retries: the SDK's own loop is switched off, because three attempts inside three attempts is nine two-minute waits |
 | **Timeouts** | `timeout=120` on every model call, so a hung request cannot freeze *Run all* |
-| **Cost circuit breaker** | `MAX_USD_PER_NOTEBOOK = 2.00`; the breaker trips **before** the next paid call. A whole run costs ≈ **$0.14** on Haiku |
+| **Cost circuit breaker** | `MAX_USD_PER_NOTEBOOK = 2.00`; the breaker trips **before** the next paid call, so the cap can be overshot by at most one response. A whole run costs ≈ **$0.14** on Haiku |
+| **Prompt caching** | each agent's system prompt is sent as a cached block, with the per-case content after the breakpoint. Cache reads are reported in `OBS`, so a cache that has stopped hitting is visible rather than merely expensive |
 | **Preflight** | the run fails at the top with an instruction, not as a traceback thirty cells in. The key is checked, never printed |
 | **Durable state** | SQLite checkpointer, probed before it is trusted, with a `MemorySaver` fallback |
-| **PII minimisation** | customer names masked (`Viktor B.`) in logs and the audit trail; full data stays in the workflow state |
-| **Prompt-injection hygiene** | tool output fenced as untrusted data + an adversarial test case |
-| **Audit trail** | append-only `audit_log.jsonl`: every case opened, human decision, executed action, override and message, joined by `case_id`, stamped with `PROMPT_VERSION` and the model |
+| **Idempotent side effects** | every customer-visible action carries a key derived from durable state, so a node replayed after a restart recognises its own earlier delivery instead of sending a second message |
+| **Fail-closed HITL** | exhausting the revision budget escalates the case; it never executes the recommendation the reviewer was objecting to |
+| **Least-privilege tools** | agents hold only what they need, every call pinned to the case, unknown tool names refused rather than crashed |
+| **PII minimisation** | customer names masked (`Viktor B.`) in logs and the audit trail; the notification body is kept verbatim on purpose, because an auditor must read what was actually sent |
+| **Prompt-injection hygiene** | tool output fenced behind a random per-call delimiter the data cannot forge, plus two adversarial profiles — one aimed at the model, one at the fence |
+| **Tamper-evident audit trail** | hash-chained `audit_log.jsonl`: every case opened, human decision, executed action, override, edit and message, joined by `case_id`, stamped with `PROMPT_VERSION` and the model. `verify_audit_trail()` names the first entry that was altered or removed |
 | **Reproducibility** | pinned model id and a `PROMPT_VERSION` recorded with every executed action |
-| **Regression eval** | a labelled set scored on every *Run all*; a drift in the risk engine fails the notebook |
-| **Runbook** | section 8.4: stuck case, budget trip, preflight failure, degraded dependency, and a graceful-degradation matrix per dependency |
-| **Graceful degradation** | every optional dependency has a fallback — a missing wheel, an unreachable `mermaid.ink`, a screening error, an absent LangSmith key |
+| **Regression evals** | two labelled sets on every *Run all* — the rule engine's scores, and the model's own classifications and disclosures. Either fails the notebook |
+| **Runbook** | section 8.4: stuck case and how long it has waited, an escalated case, budget trip, preflight failure, a broken audit chain, degraded dependency, and a graceful-degradation matrix per dependency |
+| **Graceful degradation** | every optional dependency has a fallback — a missing wheel, an unreachable `mermaid.ink`, a screening error, a tool the agent does not have, an absent LangSmith key |
 
 ## Observability & logging
 
@@ -242,7 +292,7 @@ It records `run_start`, `node_start`, `node_end`, `llm_call`, `tool_call`, `retr
 
 | Call | What you get |
 |---|---|
-| `OBS.report()` | one line: calls, tokens, cost |
+| `OBS.report()` | one line: calls, tokens, cache reads, cost |
 | `OBS.summary()` | per-node table — calls, seconds, tokens, cost, errors |
 | `OBS.timeline(limit)` | what happened, in order |
 | `OBS.errors()` | only the failures |
@@ -255,8 +305,14 @@ An exception inside a node is recorded and logged with the node's name, and then
 same secret chain and turns tracing on only if one exists; otherwise it logs one line
 saying tracing is off and continues. Nothing leaves the machine by default.
 
-*Known limitation:* per-node attribution assumes nodes run one at a time, which is true for
-this graph. Parallel branches would need a contextvar to stay accurate.
+Attribution is held in a `contextvars.ContextVar`, so it stays correct when LangGraph runs
+independent branches on worker threads. A plain attribute would bill one agent's tokens to
+whichever node wrote it last — and it would do so silently, in the very report you would
+use to check the cost.
+
+*Known limitation:* the observer counts what passes through this notebook's client. A call
+made outside the graph is filed under `unattributed` rather than missed, but nothing
+reconciles the total against the provider's own billing.
 
 ## Model configuration and cost
 
@@ -271,8 +327,16 @@ EFFORT     = None                 # None on Haiku; "low".."max" on Sonnet 5 / Op
 | `claude-sonnet-5` | $2 | $10 | `low` … `max` |
 | `claude-opus-5` | $5 | $25 | `low` … `max` |
 
-A full run: **72 LLM calls, ≈87k tokens, ≈$0.14** on Haiku. The last cells print the run's
-usage and cost per agent, so switching models shows its price immediately.
+A full run is roughly **70 LLM calls, ≈85k tokens, ≈$0.14** on Haiku — a little less since
+the analyst stopped copying transaction data back out as a tool argument and stopped making
+a screening call nobody read. The last cells print the run's usage, cache reads and cost
+per agent, so switching models shows its price immediately.
+
+Each agent's system prompt is sent as a cacheable block. On Haiku the prompts sit under the
+1024-token minimum a cached prefix needs, so today the API ignores the marker — it is there
+so that a longer prompt, or a move to Sonnet or Opus, starts paying off without anyone
+having to remember to come back for it. `OBS.report()` prints the cache reads, so whether
+it is actually hitting is measured rather than assumed.
 
 Three details of the current Claude models are handled in the code, each of which otherwise
 fails only at runtime with a live key:
@@ -294,7 +358,7 @@ every scenario cell erroring halfway through *Run all*. The pin is `>=3.1,<4`, a
 
 ## Tests
 
-164 unit and integration tests run **without an API key** — the graph is exercised end to
+218 unit and integration tests run **without an API key** — the graph is exercised end to
 end against a scripted fake LLM (real `interrupt()`, real checkpointer, real routing):
 
 ```bash
@@ -303,13 +367,14 @@ python -m pytest tests/ -v
 
 | File | Covers |
 |---|---|
-| `test_tools.py` | the 5 tools, the rule engine, the audit trail, PII masking, the injection profile |
+| `test_tools.py` | the 5 tools, the rule engine, the hash-chained audit trail and its verifier, PII masking, the least-privilege kit, both injection profiles and the unforgeable fence |
 | `test_triage.py` | classification, deterministic id extraction, priority escalation, routing, the data fence |
-| `test_screening.py` | screening the fetched name, the sanctions hard stop and its audit record |
-| `test_comms.py` | drafting before the gate, delivery only after it, suppression on reject |
-| `test_graph.py` / `test_graph_integration.py` | routing, the full graph over a fake LLM, HITL, case-id correlation |
-| `test_durability.py` | SQLite round-trip, fallback on a missing *and* on an incompatible wheel, resume after rebuilding the graph |
-| `test_hardening.py` | retries, transient classification, the cost breaker, preflight, guards being on the real path |
+| `test_screening.py` | screening the fetched name, the refused model-side screening attempt, the sanctions hard stop and its audit record |
+| `test_comms.py` | drafting before the gate, delivery only after it, suppression on reject, approve-with-edits |
+| `test_graph.py` / `test_graph_integration.py` | routing, the full graph over a fake LLM, HITL, fail-closed escalation, case-id correlation |
+| `test_durability.py` | SQLite round-trip, fallback on a missing *and* on an incompatible wheel, resume after rebuilding the graph, one delivery under replay |
+| `test_hardening.py` | retries, typed transient classification, the single retry layer, the cost breaker, preflight, unknown-tool refusal, gate staleness, refusal diagnosis, guards being on the real path |
+| `test_behavioural_eval.py` | the eval that covers the model layer: what a customer message may not disclose, and what a finished case must look like |
 | `test_colab_runall.py` | the "import, Run all, done" contract: one install cell, no `input()`, no Drive mount, one required secret |
 | `test_observability.py` | logging setup, the event recorder, per-node attribution |
 | `test_notebook_encoding.py` | the notebook is valid, matches the source, and has no mojibake |
@@ -338,7 +403,8 @@ Fraud_Detection_Multi_Agent.ipynb   the submission notebook (generated)
 fraud_multi_agent.py                same code as a VS Code / jupytext script
 build_notebook.py                   regenerates the notebook with UTF-8 enforced
 production-migration-plan.md        the plan this architecture was built from
-tests/                              164 tests, no API key required
+hareness_improvment.md              harness-engineering review and what it changed
+tests/                              218 tests, no API key required
 .env.example                        template for the local API key
 requirements-dev.txt                dependencies for local development
 docs/superpowers/                   design spec and implementation plan
