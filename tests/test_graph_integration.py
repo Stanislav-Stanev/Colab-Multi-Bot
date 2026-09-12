@@ -94,8 +94,8 @@ class Script:
             return AIMessage(content="", tool_calls=[
                 {"name": "fetch_customer_transactions",
                  "args": {"customer_id": self.customer_id}, "id": "tc1", "type": "tool_call"},
-                {"name": "check_sanctions_list",
-                 "args": {"customer_name": "Someone"}, "id": "tc2", "type": "tool_call"},
+                {"name": "calculate_risk_score",
+                 "args": {"customer_id": self.customer_id}, "id": "tc2", "type": "tool_call"},
             ])
         return AIMessage(content="Investigation complete.")
 
@@ -239,7 +239,7 @@ def test_analyst_really_invokes_tools(scripted):
 
     # the structured-output call receives plain-text tool evidence, never tool_use blocks
     prompt = "".join(str(msg.content) for msg in script.assessment_calls[0])
-    assert "fetch_customer_transactions" in prompt and "check_sanctions_list" in prompt
+    assert "fetch_customer_transactions" in prompt and "calculate_risk_score" in prompt
     assert all(not getattr(msg, "tool_calls", None) for msg in script.assessment_calls[0])
 
 
@@ -311,15 +311,87 @@ def test_case_history_priority_is_not_escalated_for_a_clean_customer(scripted):
     assert state.values["case_history"] == []
 
 
-def test_revision_budget_forces_finalisation(scripted):
+def test_revision_budget_stops_the_loop_without_executing_the_action(scripted, tmp_path,
+                                                                     monkeypatch):
+    """The loop breaker fails closed (review F1), through the real graph.
+
+    Exhausting the budget must not finalise the recommendation the reviewer kept
+    objecting to: nothing is executed, nothing is sent, the case is parked.
+    """
+    path = tmp_path / "audit.jsonl"
+    monkeypatch.setattr(m, "AUDIT_LOG_PATH", str(path))
     scripted("CUST-1337", "BLOCK")
     thread = _thread()
     result = m.start_workflow("Check CUST-1337.", thread_id=thread)
     for _ in range(m.MAX_REVISIONS):
         assert result["status"] == "awaiting_human_review"
         result = m.resume_workflow(thread, {"type": "feedback", "feedback": "again please"})
-    # budget exhausted: the next feedback no longer loops, the action is executed
+    # budget exhausted: the next feedback stops the loop, but stops it closed
     assert result["status"] == "awaiting_human_review"
     final = m.resume_workflow(thread, {"type": "feedback", "feedback": "one more"})
+
     assert final["status"] == "completed"
-    assert "ACTION EXECUTED" in final["final_output"]
+    assert "ACTION NOT EXECUTED" in final["final_output"]
+    assert "ACTION EXECUTED" not in final["final_output"]
+
+    trail = path.read_text(encoding="utf-8")
+    assert "revision_budget_exhausted" in trail
+    assert "action_executed" not in trail, "a contested action was carried out anyway"
+    assert "notification_sent" not in trail, "a message went out on an unapproved action"
+
+
+# ---- the behavioural eval must read the case it means to read --------------------------
+
+
+def test_a_scenario_captures_its_state_when_it_finishes(scripted):
+    """A thread holds its *latest* state, not the state of the case you ran on it.
+
+    Test 7 deliberately continues Test 2's thread, so reading that thread at the end of
+    the notebook returns the follow-up conversation — no customer id, signal type
+    GENERAL_QUESTION — and an eval pointed at it scores the wrong thing. Caught by the
+    live run: the eval reported a misclassified FRAUD_ALERT that had been classified
+    correctly. The state is captured when the scenario completes instead.
+    """
+    scripted("CUST-1042", "BLOCK")
+    thread = _thread()
+    result = m.run_scenario("investigation", "Investigate CUST-1042 — issuer fraud alert.",
+                            decisions=[{"type": "approve"}], thread_id=thread)
+
+    captured = result["final_state"]
+    assert captured["customer_id"] == "CUST-1042"
+    assert captured["signal_type"] == "FRAUD_ALERT"
+    assert captured["risk_assessment"]["risk_score"] >= 70
+
+    # a follow-up on the same thread overwrites what the thread holds ...
+    m.start_workflow("What was the score again?", thread_id=thread)
+    assert m.case_state(thread)["customer_id"] is None
+    assert m.case_state(thread)["signal_type"] == "GENERAL_QUESTION"
+
+    # ... but not what the scenario captured
+    assert captured["customer_id"] == "CUST-1042"
+    assert captured["signal_type"] == "FRAUD_ALERT"
+    assert m.case_violations(captured, expect_signal_type="FRAUD_ALERT",
+                             expect_action="BLOCK") == []
+
+
+def test_every_finished_run_leaves_its_own_audit_file(scripted, tmp_path, monkeypatch):
+    """Automatic, not something a cell has to remember to call."""
+    import pathlib
+    monkeypatch.setattr(m, "AUDIT_LOG_PATH", str(tmp_path / "audit.jsonl"))
+    monkeypatch.setattr(m, "AUDIT_RUN_DIR", str(tmp_path))
+    scripted("CUST-1042", "BLOCK")
+
+    started = m.start_workflow("Investigate CUST-1042.", thread_id=_thread())
+    assert not list(tmp_path.glob("audit_run-*.jsonl")), \
+        "a run still at the human gate is not finished"
+
+    m.resume_workflow(started["thread_id"], {"type": "approve"})
+
+    files = list(tmp_path.glob("audit_run-*.jsonl"))
+    assert len(files) == 1
+    events = [json.loads(line) for line in
+              files[0].read_text(encoding="utf-8").splitlines()]
+    assert {e["event"] for e in events} >= {"case_opened", "human_decision",
+                                            "action_executed", "notification_sent"}
+    assert len({e["case_id"] for e in events}) == 1
+    assert m.verify_audit_extract(str(files[0]))[0] is True

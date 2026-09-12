@@ -9,3 +9,4 @@ workflow_events.json
 *.sqlite-shm
 *.sqlite-wal
 audit_log.jsonl
+audit_run-*.jsonl

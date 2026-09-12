@@ -365,3 +365,47 @@ service clients behind timeouts and circuit breakers, the audit trail in an appe
 store rather than a file, secrets from a vault instead of Colab Secrets, OpenTelemetry
 export instead of an in-process observer, a queue in front of the graph, and the eval suite
 running in CI on every prompt change rather than on every Run all.
+
+### 8.1 Carrying the idempotency contract to the real executor
+
+`send_customer_notification` already takes an `idempotency_key` derived from durable state
+(`case_id:notify:revision_count`) and returns the original delivery on a repeat, because
+LangGraph re-runs a node from its top when a case resumes mid-node. Two things extend that
+to production:
+
+- **The real Notification API must own the dedupe**, not the caller. The key is passed to
+  it for exactly that reason — a mapping held in the workflow process is lost with the
+  process, which is the moment it was needed.
+- **`execute_action` needs the same treatment.** In the notebook the "action" renders a
+  string, so a replay is invisible beyond a duplicated `action_executed` audit line. The
+  moment it calls a real card-management API, it needs a key of the same shape
+  (`case_id:execute:revision_count`) and an executor that dedupes on it. Blocking a card
+  twice is survivable; releasing and re-blocking, or double-charging a reversal, is not.
+
+### 8.2 Mapping the observer onto OpenTelemetry
+
+`WorkflowObserver` records the right events; what it lacks is a vendor-neutral way out of
+the process. The GenAI semantic conventions map onto it almost one-to-one, so the exporter
+is a translation layer rather than a rewrite:
+
+| `OBS` event | OpenTelemetry |
+|---|---|
+| `run_start` / `run_end` | the root span of the trace, `thread_id` and `case_id` as attributes |
+| `node_start` / `node_end` | a child span per agent, named for the node |
+| `llm_call` | a `gen_ai.client.inference` span: `gen_ai.system`, `gen_ai.request.model`, and the usage counters (`gen_ai.usage.input_tokens`, `output_tokens`, cache reads) |
+| `tool_call` / `tool_unavailable` | `gen_ai.tool.execution` spans, the tool name as an attribute |
+| `retry` | a span event on the call that was retried |
+| `interrupt` / `human_decision` | span events on the node span — the pair a compliance audit actually reads |
+| `error` | span status `ERROR` plus the recorded exception |
+
+Attribution is already held in a `ContextVar`, which is what OpenTelemetry's own context
+propagation uses, so spans nest correctly across parallel branches without further work.
+LangSmith stays useful alongside it for prompt-level debugging; OTel is what a bank's
+platform team will ask for first.
+
+### 8.3 An SLA on cases parked at the human gate
+
+The state records `awaiting_review_since`, and `hours_awaiting_review()` reads it, but
+nothing acts on it: a P1 that reaches the gate on a Friday evening is still sitting there on
+Monday. Production needs a sweeper over the checkpoint store that escalates or re-notifies
+past a per-priority threshold. The timestamp it needs already exists; the scheduler does not.

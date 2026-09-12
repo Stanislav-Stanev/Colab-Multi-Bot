@@ -23,7 +23,13 @@ class _StructuredFake:
 
 
 class AnalystFakeLLM:
-    """An analyst that screens the *wrong* name, exactly as the live model did."""
+    """An analyst that tries to screen a name of its own choosing.
+
+    The live model called `check_sanctions_list("CUST-4444")` before it had fetched the
+    profile. The tool is no longer in its kit (review F10), so the attempt is refused —
+    and the screening that actually counts still happens, in the harness, on the fetched
+    name. Either way the model cannot decide who gets screened.
+    """
 
     def __init__(self, screened_name, action="CLEAR"):
         self.screened_name = screened_name
@@ -67,9 +73,24 @@ def analyst_llm(monkeypatch):
 
 
 def test_screening_uses_the_name_the_core_banking_system_returned(analyst_llm):
-    """Even when the model screened the customer id, the hit is still found."""
+    """Even when the model tried to screen the customer id, the hit is still found."""
     analyst_llm(screened_name="CUST-4444")
     out = m.fraud_analyst({"user_request": "Review CUST-4444.", "customer_id": "CUST-4444"})
+    assert out["risk_assessment"]["sanctions_match"] is True
+    assert out["risk_assessment"]["screened_name"] == "Viktor Baranov"
+
+
+def test_the_model_cannot_screen_a_name_of_its_own_choosing(analyst_llm, fresh_observer):
+    """Two layers, both holding (review F10).
+
+    The model's attempt to screen whatever it liked is refused because the tool is not in
+    its kit, and the screen that decides the case is the harness one, on the fetched name.
+    """
+    analyst_llm(screened_name="Definitely Not On Any List")
+    out = m.fraud_analyst({"user_request": "Review CUST-4444.", "customer_id": "CUST-4444"})
+
+    refused = [e for e in fresh_observer.events if e["event"] == "tool_unavailable"]
+    assert [e["tool"] for e in refused] == ["check_sanctions_list"]
     assert out["risk_assessment"]["sanctions_match"] is True
     assert out["risk_assessment"]["screened_name"] == "Viktor Baranov"
 

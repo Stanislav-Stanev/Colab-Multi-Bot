@@ -1,5 +1,12 @@
 # Design: Observability & Logging for the Fraud Detection Workflow
 
+> **Historical record — superseded in places.** This document says what was planned on
+> 2026-09-10 and is kept unedited for that reason. The code has since moved on: the
+> RevolutBank rebrand added a triage and a comms agent, and the harness-engineering
+> review ([`hareness_improvment.md`](../../../hareness_improvment.md)) changed the tool
+> signatures, the analyst's tool kit, the revision-exhaustion route and the audit format.
+> For current behaviour read `fraud_multi_agent.py`, `README.md` and `CLAUDE.md`.
+
 **Date:** 2026-09-10
 **Extends:** [2026-09-10-fraud-detection-multi-agent-design.md](2026-09-10-fraud-detection-multi-agent-design.md)
 

@@ -253,3 +253,73 @@ def test_langsmith_turns_on_with_a_key(monkeypatch):
 def test_get_secret_or_none_does_not_raise(monkeypatch):
     monkeypatch.delenv("DEFINITELY_NOT_SET_XYZ", raising=False)
     assert m.get_secret_or_none("DEFINITELY_NOT_SET_XYZ") is None
+
+# ---- attribution survives concurrency (review F7) --------------------------------------
+
+
+def test_a_node_keeps_its_own_attribution_while_another_runs_alongside(fresh_observer):
+    """A plain attribute is shared by every thread; a ContextVar is not.
+
+    The graph runs one node at a time today, but LangGraph fans branches out across
+    threads as soon as two are independent — and the failure is silent: the token spend
+    of one agent is simply billed to whichever node last wrote the attribute. Here both
+    nodes are deliberately inside their bodies at the same moment.
+    """
+    import threading
+
+    analyst_inside, officer_inside = threading.Event(), threading.Event()
+    officer_may_record, officer_done = threading.Event(), threading.Event()
+
+    @m.observe_node("fraud_analyst")
+    def analyst(_state):
+        analyst_inside.set()
+        assert officer_inside.wait(timeout=5), "the other node never started"
+        fresh_observer.on_llm_end(_Response(1000, 100))
+        officer_may_record.set()
+        # stay inside this node while the other one reports its own spend, so the two
+        # bodies genuinely overlap rather than merely being started together
+        assert officer_done.wait(timeout=5)
+        return {}
+
+    @m.observe_node("compliance_officer")
+    def officer(_state):
+        assert analyst_inside.wait(timeout=5)
+        officer_inside.set()
+        assert officer_may_record.wait(timeout=5)
+        fresh_observer.on_llm_end(_Response(30, 3))
+        officer_done.set()
+        return {}
+
+    worker = threading.Thread(target=officer, args=({},))
+    worker.start()
+    analyst({})
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+
+    assert fresh_observer.nodes["fraud_analyst"].input_tokens == 1000
+    assert fresh_observer.nodes["fraud_analyst"].output_tokens == 100
+    assert fresh_observer.nodes["compliance_officer"].input_tokens == 30
+    assert fresh_observer.nodes["compliance_officer"].output_tokens == 3
+    assert "unattributed" not in fresh_observer.nodes
+
+
+def test_an_event_recorded_in_one_node_is_not_stamped_with_another(fresh_observer):
+    import threading
+
+    fresh_observer.start_run("t", "r")
+    stamped = {}
+
+    @m.observe_node("triage")
+    def triage(_state):
+        stamped["event"] = fresh_observer.record("tool_call", tool="lookup_case_history")
+        return {}
+
+    @m.observe_node("fraud_analyst")
+    def analyst(_state):
+        worker = threading.Thread(target=triage, args=({},))
+        worker.start()
+        worker.join(timeout=5)
+        return {"node_seen_after": fresh_observer.current_node}
+
+    assert analyst({})["node_seen_after"] == "fraud_analyst"
+    assert stamped["event"]["node"] == "triage"

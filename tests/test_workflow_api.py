@@ -116,3 +116,25 @@ def test_execute_workflow_never_prompts_when_fully_scripted(monkeypatch):
 def test_ask_human_parses_operator_input(monkeypatch, typed, expected):
     monkeypatch.setattr("builtins.input", lambda _="": typed)
     assert m.ask_human(_payload()) == expected
+
+
+# ---- approve-with-edits reaches the operator (review F11) -------------------------------
+
+
+def test_ask_human_offers_an_edit_path(monkeypatch):
+    """Typing `edit: ...` approves and replaces the text, in one step."""
+    monkeypatch.setattr("builtins.input", lambda _="": "edit: Your card is paused.")
+    assert m.ask_human(_payload()) == {"type": "approve",
+                                       "edited_body": "Your card is paused."}
+
+
+def test_edit_is_not_mistaken_for_feedback(monkeypatch):
+    """Free text is still feedback; only the explicit prefix means "send exactly this"."""
+    monkeypatch.setattr("builtins.input", lambda _="": "please edit the wording")
+    assert m.ask_human(_payload())["type"] == "feedback"
+
+
+def test_the_gate_tells_the_reviewer_the_edit_option_exists():
+    prompt = m.HUMAN_REVIEW_QUESTION.lower()
+    for option in ("approve", "feedback", "reject", "edit"):
+        assert option in prompt
