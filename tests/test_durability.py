@@ -109,3 +109,72 @@ def test_a_paused_case_survives_recompiling_the_graph(monkeypatch):
     done = m.resume_workflow(thread, {"type": "approve"})
     assert done["status"] == "completed"
     assert "BLOCKED" in done["final_output"]
+
+
+# ---- side effects survive a replay without happening twice (review F6) -----------------
+
+
+def test_the_same_notification_is_delivered_once_however_often_it_replays(tmp_path,
+                                                                          monkeypatch):
+    """LangGraph re-runs a node from its top when a case resumes mid-node.
+
+    Without a key derived from durable state, a resumed case mints a second delivery id
+    and the customer is told twice — in the mock it is invisible, in production it is the
+    first incident.
+    """
+    import json
+    monkeypatch.setattr(m, "AUDIT_LOG_PATH", str(tmp_path / "audit.jsonl"))
+    m._DELIVERED.clear()
+    args = {"customer_id": "CUST-1042", "channel": "push", "subject": "Card blocked",
+            "body": "We paused your card.", "case_id": "CASE-REPLAY",
+            "idempotency_key": "CASE-REPLAY:notify:0"}
+
+    first = json.loads(m.send_customer_notification.invoke(args))
+    second = json.loads(m.send_customer_notification.invoke(args))
+
+    assert first["status"] == "queued"
+    assert second["delivery_id"] == first["delivery_id"], "a replay minted a second delivery"
+    assert second["status"] == "duplicate"
+
+    entries = [json.loads(line) for line
+               in (tmp_path / "audit.jsonl").read_text(encoding="utf-8").splitlines()]
+    sent = [e for e in entries if e["event"] == "notification_sent"]
+    assert len(sent) == 1, "one approval produced two deliveries in the audit trail"
+
+
+def test_a_different_revision_is_a_different_message(tmp_path, monkeypatch):
+    """Idempotency must not swallow a genuinely new message after a revision round."""
+    import json
+    monkeypatch.setattr(m, "AUDIT_LOG_PATH", str(tmp_path / "audit.jsonl"))
+    m._DELIVERED.clear()
+    base = {"customer_id": "CUST-1042", "channel": "push", "subject": "s", "body": "b",
+            "case_id": "CASE-REV"}
+
+    first = json.loads(m.send_customer_notification.invoke(
+        {**base, "idempotency_key": "CASE-REV:notify:0"}))
+    second = json.loads(m.send_customer_notification.invoke(
+        {**base, "idempotency_key": "CASE-REV:notify:1"}))
+
+    assert first["delivery_id"] != second["delivery_id"]
+    assert second["status"] == "queued"
+
+
+def test_delivery_derives_its_key_from_durable_state(tmp_path, monkeypatch):
+    """The key comes from the case and its revision — state that survives the restart."""
+    import json
+    monkeypatch.setattr(m, "AUDIT_LOG_PATH", str(tmp_path / "audit.jsonl"))
+    m._DELIVERED.clear()
+    state = {"customer_id": "CUST-1042", "case_id": "CASE-KEY", "revision_count": 2,
+             "recommended_action": "BLOCK", "human_decision": {"type": "approve"},
+             "notification_draft": {"channel": "push", "language": "en",
+                                    "subject": "s", "body": "b"},
+             "final_output": "ACTION EXECUTED"}
+
+    first = m.comms_deliver(dict(state))
+    second = m.comms_deliver(dict(state))          # the node replays after a resume
+
+    assert first["notification_result"]["status"] == "queued"
+    assert second["notification_result"]["status"] == "duplicate"
+    entries = [json.loads(line) for line
+               in (tmp_path / "audit.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert len([e for e in entries if e["event"] == "notification_sent"]) == 1

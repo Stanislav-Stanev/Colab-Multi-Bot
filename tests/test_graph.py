@@ -21,10 +21,42 @@ def test_route_after_review():
          "revision_count": 1}) == "compliance_officer"
     assert m.route_after_review(
         {"human_decision": {"type": "reject"}, "revision_count": 0}) == "cancel_action"
-    # revision guard: after MAX_REVISIONS, feedback stops looping and finalises
+    # revision guard: after MAX_REVISIONS the loop stops, but it must stop *closed* —
+    # the reviewer's last word was an objection, so the contested action is never executed.
     assert m.route_after_review(
         {"human_decision": {"type": "feedback", "feedback": "x"},
-         "revision_count": m.MAX_REVISIONS}) == "execute_action"
+         "revision_count": m.MAX_REVISIONS}) == "escalate"
+
+
+def test_exhausting_the_revision_budget_never_executes_the_contested_action():
+    """Fail closed, not open (review F1).
+
+    A loop breaker that finalises the action the human was still arguing with performs a
+    card block nobody approved. Exhaustion parks the case for a senior reviewer instead.
+    """
+    for count in (m.MAX_REVISIONS, m.MAX_REVISIONS + 5):
+        assert m.route_after_review(
+            {"human_decision": {"type": "feedback", "feedback": "still wrong"},
+             "revision_count": count}) == "escalate"
+
+
+def test_escalate_parks_the_case_without_acting(tmp_path, monkeypatch):
+    monkeypatch.setattr(m, "AUDIT_LOG_PATH", str(tmp_path / "audit.jsonl"))
+    out = m.escalate({"customer_id": "CUST-1337", "case_id": "CASE-ESC",
+                      "recommended_action": "BLOCK", "report": "# Report",
+                      "revision_count": m.MAX_REVISIONS})
+    assert "NOT EXECUTED" in out["final_output"]
+    assert "senior" in out["final_output"].lower()
+    # the report the reviewer kept objecting to is preserved for whoever picks the case up
+    assert "# Report" in out["final_output"]
+
+    import json
+    entries = [json.loads(line) for line
+               in (tmp_path / "audit.jsonl").read_text(encoding="utf-8").splitlines()]
+    parked = [e for e in entries if e["event"] == "revision_budget_exhausted"]
+    assert len(parked) == 1
+    assert parked[0]["declined_action"] == "BLOCK"
+    assert parked[0]["revisions"] == m.MAX_REVISIONS
 
 
 def test_execute_action_renders_block_effect():

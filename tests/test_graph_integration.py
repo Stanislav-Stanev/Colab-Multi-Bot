@@ -94,8 +94,8 @@ class Script:
             return AIMessage(content="", tool_calls=[
                 {"name": "fetch_customer_transactions",
                  "args": {"customer_id": self.customer_id}, "id": "tc1", "type": "tool_call"},
-                {"name": "check_sanctions_list",
-                 "args": {"customer_name": "Someone"}, "id": "tc2", "type": "tool_call"},
+                {"name": "calculate_risk_score",
+                 "args": {"customer_id": self.customer_id}, "id": "tc2", "type": "tool_call"},
             ])
         return AIMessage(content="Investigation complete.")
 
@@ -239,7 +239,7 @@ def test_analyst_really_invokes_tools(scripted):
 
     # the structured-output call receives plain-text tool evidence, never tool_use blocks
     prompt = "".join(str(msg.content) for msg in script.assessment_calls[0])
-    assert "fetch_customer_transactions" in prompt and "check_sanctions_list" in prompt
+    assert "fetch_customer_transactions" in prompt and "calculate_risk_score" in prompt
     assert all(not getattr(msg, "tool_calls", None) for msg in script.assessment_calls[0])
 
 
@@ -311,15 +311,30 @@ def test_case_history_priority_is_not_escalated_for_a_clean_customer(scripted):
     assert state.values["case_history"] == []
 
 
-def test_revision_budget_forces_finalisation(scripted):
+def test_revision_budget_stops_the_loop_without_executing_the_action(scripted, tmp_path,
+                                                                     monkeypatch):
+    """The loop breaker fails closed (review F1), through the real graph.
+
+    Exhausting the budget must not finalise the recommendation the reviewer kept
+    objecting to: nothing is executed, nothing is sent, the case is parked.
+    """
+    path = tmp_path / "audit.jsonl"
+    monkeypatch.setattr(m, "AUDIT_LOG_PATH", str(path))
     scripted("CUST-1337", "BLOCK")
     thread = _thread()
     result = m.start_workflow("Check CUST-1337.", thread_id=thread)
     for _ in range(m.MAX_REVISIONS):
         assert result["status"] == "awaiting_human_review"
         result = m.resume_workflow(thread, {"type": "feedback", "feedback": "again please"})
-    # budget exhausted: the next feedback no longer loops, the action is executed
+    # budget exhausted: the next feedback stops the loop, but stops it closed
     assert result["status"] == "awaiting_human_review"
     final = m.resume_workflow(thread, {"type": "feedback", "feedback": "one more"})
+
     assert final["status"] == "completed"
-    assert "ACTION EXECUTED" in final["final_output"]
+    assert "ACTION NOT EXECUTED" in final["final_output"]
+    assert "ACTION EXECUTED" not in final["final_output"]
+
+    trail = path.read_text(encoding="utf-8")
+    assert "revision_budget_exhausted" in trail
+    assert "action_executed" not in trail, "a contested action was carried out anyway"
+    assert "notification_sent" not in trail, "a message went out on an unapproved action"

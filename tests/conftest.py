@@ -16,7 +16,14 @@ import fraud_multi_agent as m  # noqa: E402
 
 @pytest.fixture
 def fresh_observer(monkeypatch):
-    """A test-local observer, so token counts and events never leak between tests."""
+    """A test-local observer, so token counts and events never leak between tests.
+
+    Which node is being attributed lives in a ContextVar rather than on the observer (so
+    branches running on worker threads keep their own), and a ContextVar outlives the
+    object — so it is reset here too, or one test's node would label the next one's events.
+    """
     observer = m.WorkflowObserver()
     monkeypatch.setattr(m, "OBS", observer)
-    return observer
+    token = m._CURRENT_NODE.set(None)
+    yield observer
+    m._CURRENT_NODE.reset(token)
