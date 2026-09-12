@@ -1,4 +1,5 @@
 import json
+import pathlib
 import re
 
 import fraud_multi_agent as m
@@ -323,3 +324,83 @@ def test_deleting_an_entry_is_detected(tmp_path, monkeypatch):
 def test_verifying_a_trail_that_does_not_exist_is_not_an_error(tmp_path):
     ok, message = m.verify_audit_trail(str(tmp_path / "nothing.jsonl"))
     assert ok is True and "no" in message.lower()
+
+
+# ---- a per-run copy of the trail --------------------------------------------------------
+
+
+def _trail_entries(path):
+    return [json.loads(line) for line in
+            pathlib.Path(path).read_text(encoding="utf-8").splitlines()]
+
+
+def test_a_finished_run_gets_its_own_audit_file(tmp_path, monkeypatch, fresh_observer):
+    """One file per run, alongside the continuous trail rather than instead of it."""
+    monkeypatch.setattr(m, "AUDIT_LOG_PATH", str(tmp_path / "audit.jsonl"))
+    fresh_observer.start_run("thread-a", "review CUST-1001")
+    run_id = fresh_observer.run_id
+    m.audit("case_opened", case_id="CASE-A", customer_id="CUST-1001")
+    m.audit("action_executed", case_id="CASE-A", customer_id="CUST-1001", action="CLEAR")
+
+    path = m.export_run_audit()
+
+    assert path and pathlib.Path(path).exists()
+    assert run_id in pathlib.Path(path).name
+    assert [e["event"] for e in _trail_entries(path)] == ["case_opened", "action_executed"]
+
+
+def test_the_per_run_file_holds_only_that_run(tmp_path, monkeypatch, fresh_observer):
+    monkeypatch.setattr(m, "AUDIT_LOG_PATH", str(tmp_path / "audit.jsonl"))
+    fresh_observer.start_run("thread-a", "first")
+    first_id = fresh_observer.run_id
+    m.audit("case_opened", customer_id="CUST-1001")
+    first_path = m.export_run_audit()
+
+    fresh_observer.start_run("thread-b", "second")
+    m.audit("case_opened", customer_id="CUST-1042")
+    m.audit("action_executed", customer_id="CUST-1042", action="BLOCK")
+    second_path = m.export_run_audit()
+
+    assert first_path != second_path
+    assert {e["customer_id"] for e in _trail_entries(first_path)} == {"CUST-1001"}
+    assert {e["customer_id"] for e in _trail_entries(second_path)} == {"CUST-1042"}
+    # the continuous trail still holds everything, in one chain
+    assert len(_trail_entries(tmp_path / "audit.jsonl")) == 3
+    assert m.verify_audit_trail(str(tmp_path / "audit.jsonl"))[0] is True
+
+
+def test_the_extract_keeps_the_original_hashes(tmp_path, monkeypatch, fresh_observer):
+    """Verbatim lines, so an extract can be matched back to the trail it came from.
+
+    Re-chaining the copy would give it hashes that disagree with the master for the same
+    events, and then neither file could be used to check the other.
+    """
+    monkeypatch.setattr(m, "AUDIT_LOG_PATH", str(tmp_path / "audit.jsonl"))
+    fresh_observer.start_run("t", "r")
+    m.audit("case_opened", customer_id="CUST-1042")
+    written = _trail_entries(tmp_path / "audit.jsonl")[0]
+
+    extracted = _trail_entries(m.export_run_audit())[0]
+    assert extracted == written
+
+
+def test_an_edited_extract_is_detected(tmp_path, monkeypatch, fresh_observer):
+    monkeypatch.setattr(m, "AUDIT_LOG_PATH", str(tmp_path / "audit.jsonl"))
+    fresh_observer.start_run("t", "r")
+    m.audit("action_executed", customer_id="CUST-1042", action="BLOCK")
+    path = pathlib.Path(m.export_run_audit())
+
+    assert m.verify_audit_extract(str(path))[0] is True
+    entry = _trail_entries(path)[0]
+    entry["action"] = "CLEAR"
+    path.write_text(json.dumps(entry, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    ok, message = m.verify_audit_extract(str(path))
+    assert ok is False and "1" in message
+
+
+def test_exporting_without_a_run_or_a_trail_is_not_an_error(tmp_path, monkeypatch,
+                                                            fresh_observer):
+    monkeypatch.setattr(m, "AUDIT_LOG_PATH", str(tmp_path / "missing.jsonl"))
+    fresh_observer.start_run("t", "r")
+    assert m.export_run_audit() is None

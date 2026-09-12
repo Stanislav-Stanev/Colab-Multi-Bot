@@ -269,6 +269,7 @@ are the low-level halves underneath.
 | **PII minimisation** | customer names masked (`Viktor B.`) in logs and the audit trail; the notification body is kept verbatim on purpose, because an auditor must read what was actually sent |
 | **Prompt-injection hygiene** | tool output fenced behind a random per-call delimiter the data cannot forge, plus two adversarial profiles — one aimed at the model, one at the fence |
 | **Tamper-evident audit trail** | hash-chained `audit_log.jsonl`: every case opened, human decision, executed action, override, edit and message, joined by `case_id`, stamped with `PROMPT_VERSION` and the model. `verify_audit_trail()` names the first entry that was altered or removed |
+| **Per-run extracts** | every finished run also leaves `audit_run-<id>.jsonl`, so one case can be read or handed over without the whole trail. Lines are copied verbatim — hashes included — and `verify_audit_extract()` checks them |
 | **Reproducibility** | pinned model id and a `PROMPT_VERSION` recorded with every executed action |
 | **Regression evals** | two labelled sets on every *Run all* — the rule engine's scores, and the model's own classifications and disclosures. Either fails the notebook |
 | **Runbook** | section 8.4: stuck case and how long it has waited, an escalated case, budget trip, preflight failure, a broken audit chain, degraded dependency, and a graceful-degradation matrix per dependency |
@@ -358,7 +359,7 @@ every scenario cell erroring halfway through *Run all*. The pin is `>=3.1,<4`, a
 
 ## Tests
 
-218 unit and integration tests run **without an API key** — the graph is exercised end to
+237 unit and integration tests run **without an API key** — the graph is exercised end to
 end against a scripted fake LLM (real `interrupt()`, real checkpointer, real routing):
 
 ```bash
@@ -375,6 +376,7 @@ python -m pytest tests/ -v
 | `test_durability.py` | SQLite round-trip, fallback on a missing *and* on an incompatible wheel, resume after rebuilding the graph, one delivery under replay |
 | `test_hardening.py` | retries, typed transient classification, the single retry layer, the cost breaker, preflight, unknown-tool refusal, gate staleness, refusal diagnosis, guards being on the real path |
 | `test_behavioural_eval.py` | the eval that covers the model layer: what a customer message may not disclose, and what a finished case must look like |
+| `test_audit_report.py` | section 10: the run's trail rendered case by case — session filtering, grouping, the human's decision and feedback, the delivered message |
 | `test_colab_runall.py` | the "import, Run all, done" contract: one install cell, no `input()`, no Drive mount, one required secret |
 | `test_observability.py` | logging setup, the event recorder, per-node attribution |
 | `test_notebook_encoding.py` | the notebook is valid, matches the source, and has no mojibake |
@@ -404,7 +406,7 @@ fraud_multi_agent.py                same code as a VS Code / jupytext script
 build_notebook.py                   regenerates the notebook with UTF-8 enforced
 production-migration-plan.md        the plan this architecture was built from
 hareness_improvment.md              harness-engineering review and what it changed
-tests/                              218 tests, no API key required
+tests/                              237 tests, no API key required
 .env.example                        template for the local API key
 requirements-dev.txt                dependencies for local development
 docs/superpowers/                   design spec and implementation plan

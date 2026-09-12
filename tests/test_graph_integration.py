@@ -338,3 +338,60 @@ def test_revision_budget_stops_the_loop_without_executing_the_action(scripted, t
     assert "revision_budget_exhausted" in trail
     assert "action_executed" not in trail, "a contested action was carried out anyway"
     assert "notification_sent" not in trail, "a message went out on an unapproved action"
+
+
+# ---- the behavioural eval must read the case it means to read --------------------------
+
+
+def test_a_scenario_captures_its_state_when_it_finishes(scripted):
+    """A thread holds its *latest* state, not the state of the case you ran on it.
+
+    Test 7 deliberately continues Test 2's thread, so reading that thread at the end of
+    the notebook returns the follow-up conversation — no customer id, signal type
+    GENERAL_QUESTION — and an eval pointed at it scores the wrong thing. Caught by the
+    live run: the eval reported a misclassified FRAUD_ALERT that had been classified
+    correctly. The state is captured when the scenario completes instead.
+    """
+    scripted("CUST-1042", "BLOCK")
+    thread = _thread()
+    result = m.run_scenario("investigation", "Investigate CUST-1042 — issuer fraud alert.",
+                            decisions=[{"type": "approve"}], thread_id=thread)
+
+    captured = result["final_state"]
+    assert captured["customer_id"] == "CUST-1042"
+    assert captured["signal_type"] == "FRAUD_ALERT"
+    assert captured["risk_assessment"]["risk_score"] >= 70
+
+    # a follow-up on the same thread overwrites what the thread holds ...
+    m.start_workflow("What was the score again?", thread_id=thread)
+    assert m.case_state(thread)["customer_id"] is None
+    assert m.case_state(thread)["signal_type"] == "GENERAL_QUESTION"
+
+    # ... but not what the scenario captured
+    assert captured["customer_id"] == "CUST-1042"
+    assert captured["signal_type"] == "FRAUD_ALERT"
+    assert m.case_violations(captured, expect_signal_type="FRAUD_ALERT",
+                             expect_action="BLOCK") == []
+
+
+def test_every_finished_run_leaves_its_own_audit_file(scripted, tmp_path, monkeypatch):
+    """Automatic, not something a cell has to remember to call."""
+    import pathlib
+    monkeypatch.setattr(m, "AUDIT_LOG_PATH", str(tmp_path / "audit.jsonl"))
+    monkeypatch.setattr(m, "AUDIT_RUN_DIR", str(tmp_path))
+    scripted("CUST-1042", "BLOCK")
+
+    started = m.start_workflow("Investigate CUST-1042.", thread_id=_thread())
+    assert not list(tmp_path.glob("audit_run-*.jsonl")), \
+        "a run still at the human gate is not finished"
+
+    m.resume_workflow(started["thread_id"], {"type": "approve"})
+
+    files = list(tmp_path.glob("audit_run-*.jsonl"))
+    assert len(files) == 1
+    events = [json.loads(line) for line in
+              files[0].read_text(encoding="utf-8").splitlines()]
+    assert {e["event"] for e in events} >= {"case_opened", "human_decision",
+                                            "action_executed", "notification_sent"}
+    assert len({e["case_id"] for e in events}) == 1
+    assert m.verify_audit_extract(str(files[0]))[0] is True

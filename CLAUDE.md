@@ -64,7 +64,7 @@ LangGraph `StateGraph` over `FraudWorkflowState` (a TypedDict with an `add_messa
 
 ### Audit and reproducibility
 
-`audit_log.jsonl` is append-only *and hash-chained*, joined by `case_id`, stamped with `PROMPT_VERSION` and the model id. **Bump `PROMPT_VERSION`** (top of `fraud_multi_agent.py`) whenever an agent system prompt changes. Customer names are PII-masked (`Viktor B.`) in logs and the audit trail; notification `subject`/`body` are deliberately kept verbatim, because an auditor must read what was actually sent.
+`audit_log.jsonl` is append-only *and hash-chained*, joined by `case_id`, stamped with `PROMPT_VERSION` and the model id. Each finished run additionally exports `audit_run-<run_id>.jsonl` (hooked into `OBS.end_run`) — a verbatim **extract**, not a second source of truth: the continuous trail is what detects a deleted entry, since a directory of per-run files cannot show that one is missing. Don't re-chain the extracts; the same event would then carry two different hashes in two files. **Bump `PROMPT_VERSION`** (top of `fraud_multi_agent.py`) whenever an agent system prompt changes. Customer names are PII-masked (`Viktor B.`) in logs and the audit trail; notification `subject`/`body` are deliberately kept verbatim, because an auditor must read what was actually sent.
 
 Two evals fail the notebook on every "Run all": section 8.1 scores the rule engine, and section 8.1b (`case_violations` / `message_policy_violations`) scores what the *model* did — classification, the reported score still being the engine's, and whether a customer message disclosed a rule name, the score, or screening. Both read state the run already produced, so neither costs a token.
 

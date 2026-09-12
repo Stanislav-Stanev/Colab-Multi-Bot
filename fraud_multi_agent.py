@@ -226,6 +226,7 @@ class WorkflowObserver(BaseCallbackHandler):
         self.events: list = []
         self.nodes: dict = {}
         self.run_id: Optional[str] = None
+        self.run_ids: list = []
         self.thread_id: Optional[str] = None
         self._t0 = time.perf_counter()
 
@@ -252,6 +253,10 @@ class WorkflowObserver(BaseCallbackHandler):
 
     def start_run(self, thread_id: str, user_request: str) -> str:
         self.run_id = f"run-{uuid.uuid4().hex[:8]}"
+        # Every run this observer has seen, in order. The audit file outlives a session
+        # when it is a local one, so this is what separates "what this notebook did" from
+        # "what the file happens to contain".
+        self.run_ids.append(self.run_id)
         self.thread_id = thread_id
         self._t0 = time.perf_counter()
         _CURRENT_NODE.set(None)
@@ -261,6 +266,14 @@ class WorkflowObserver(BaseCallbackHandler):
 
     def end_run(self, status: str) -> None:
         self.record("run_end", status=status, cost_usd=round(self.cost_usd, 6))
+        # One file per finished case, written here rather than asked for by a call site:
+        # a run that ends is exactly when there is something complete to hand over.
+        try:
+            path = export_run_audit(self.run_id)
+            if path:
+                log.info("🧾 audit extract for this run: %s", path)
+        except Exception as exc:                # an extract must never fail a finished case
+            log.warning("could not write the audit extract: %s: %s", type(exc).__name__, exc)
 
     # ---- LangChain callback hooks ----------------------------------------------
     def on_llm_end(self, response, **kwargs) -> None:
@@ -429,6 +442,141 @@ def audit(event: str, **fields) -> dict:
     with open(AUDIT_LOG_PATH, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
     return entry
+
+
+# Where the per-run copies go. Empty means "next to the continuous trail", which keeps
+# tests (and a Colab runtime) from scattering files somewhere unexpected.
+AUDIT_RUN_DIR = os.getenv("FRAUD_AUDIT_RUN_DIR", "")
+
+
+def run_audit_path(run_id: str) -> str:
+    directory = AUDIT_RUN_DIR or os.path.dirname(os.path.abspath(AUDIT_LOG_PATH))
+    return os.path.join(directory, f"audit_{run_id}.jsonl")
+
+
+def export_run_audit(run_id: Optional[str] = None, path: Optional[str] = None) -> Optional[str]:
+    """Copy one run's entries into their own file. Returns the path, or None.
+
+    An *extract*, deliberately, not a second source of truth. The lines are copied
+    verbatim — original `prev_hash` and `entry_hash` intact — so any entry here can be
+    matched back to the same entry in the continuous trail. Re-chaining the copy would
+    give the same event two different hashes in two files, and then neither could be used
+    to check the other.
+
+    Note what an extract cannot do: the continuous trail detects a *deleted* entry,
+    because deleting one breaks the chain across the gap. A directory of per-run files
+    cannot detect a deleted file — nothing links one run to the next. So this is a
+    convenience for reading and handing over one case, and `audit_log.jsonl` remains the
+    artefact that proves nothing was removed.
+    """
+    run_id = run_id or OBS.run_id
+    if not run_id or not os.path.exists(AUDIT_LOG_PATH):
+        return None
+    with open(AUDIT_LOG_PATH, "r", encoding="utf-8") as fh:
+        lines = [line for line in fh
+                 if line.strip() and json.loads(line).get("run_id") == run_id]
+    if not lines:
+        return None
+    path = path or run_audit_path(run_id)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.writelines(line if line.endswith("\n") else line + "\n" for line in lines)
+    log.debug("audit extract for %s written to %s (%d entries)", run_id, path, len(lines))
+    return path
+
+
+def session_audit_entries(path: Optional[str] = None) -> list:
+    """The audit entries this notebook session produced.
+
+    A Colab runtime starts with an empty trail, but a local one accumulates across
+    sessions — so the file is filtered to the runs this observer actually saw. With no
+    runs recorded (a kernel restarted and a case resumed, say) the whole file is the
+    honest answer rather than an empty report.
+    """
+    path = path or AUDIT_LOG_PATH
+    if not os.path.exists(path):
+        return []
+    with open(path, "r", encoding="utf-8") as fh:
+        entries = [json.loads(line) for line in fh if line.strip()]
+    known = set(OBS.run_ids)
+    return [e for e in entries if e.get("run_id") in known] if known else entries
+
+
+# How each event reads in the report, and which of its fields are worth showing.
+_AUDIT_EVENT_FIELDS = {
+    "case_opened":               ("signal_type", "priority", "prior_cases", "rationale"),
+    "human_decision":            ("decision", "reviewed_action", "feedback"),
+    "message_edited_by_reviewer": ("original_body", "edited_body"),
+    "recommendation_overridden": ("from", "to", "reason"),
+    "action_executed":           ("action", "risk_score", "prompt_version", "model"),
+    "action_cancelled":          ("declined_action",),
+    "revision_budget_exhausted": ("declined_action", "revisions"),
+    "notification_sent":         ("channel", "subject", "body", "delivery_id"),
+    "notification_skipped":      ("reason",),
+    "notification_suppressed":   ("reason",),
+}
+
+
+def format_audit_trail(entries: list) -> str:
+    """Render audit entries grouped by case — the trail as a reviewer reads it.
+
+    Section 8.3 answers "is the record intact"; this answers "what happened, case by
+    case", which a flat tail of a JSONL file does not. Nothing is dropped: an entry with
+    no case id is still shown, under its own heading.
+    """
+    if not entries:
+        return "(no audit entries — no case has been executed in this session)"
+
+    cases: dict = {}
+    for entry in entries:
+        cases.setdefault(entry.get("case_id") or "(no case id)", []).append(entry)
+
+    lines = []
+    for case_id, case_entries in cases.items():
+        opened = next((e for e in case_entries if e["event"] == "case_opened"), {})
+        customer = next((e.get("customer_id") for e in case_entries
+                         if e.get("customer_id")), "-")
+        header = f"{case_id} · {customer}"
+        for field in ("signal_type", "priority"):
+            if opened.get(field):
+                header += f" · {opened[field]}"
+        lines += ["", header, "-" * max(len(header), 76)]
+
+        for entry in case_entries:
+            shown = []
+            for field in _AUDIT_EVENT_FIELDS.get(entry["event"], ()):
+                value = entry.get(field)
+                if value in (None, ""):
+                    continue
+                value = " ".join(str(value).split())
+                shown.append(f"{field}={value[:120]}{'…' if len(value) > 120 else ''}")
+            # 2 spaces + 8 for the time + 2 + 26 for the event name: continuation lines
+            # start under the first field, not two columns to its left.
+            detail = ("\n" + " " * 38).join(shown)
+            lines.append(f"  {entry['ts'][11:19]}  {entry['event']:<26}{detail}")
+    return "\n".join(lines).strip("\n")
+
+
+def verify_audit_extract(path: str) -> tuple:
+    """Check every entry in an extract still matches its own hash.
+
+    Not the chain: an extract holds a subset, so consecutive entries need not follow one
+    another. What this catches is an entry edited after it was copied out.
+    """
+    if not os.path.exists(path):
+        return True, f"no extract at {path}"
+    count = 0
+    with open(path, "r", encoding="utf-8") as fh:
+        for number, line in enumerate(fh, start=1):
+            if not line.strip():
+                continue
+            count += 1
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                return False, f"entry {number} is not readable JSON"
+            if _entry_hash(entry) != entry.get("entry_hash"):
+                return False, f"entry {number} was altered after it was written"
+    return True, f"extract intact: {count} entries match their recorded hashes"
 
 
 def verify_audit_trail(path: Optional[str] = None) -> tuple:
@@ -1885,6 +2033,16 @@ def hours_awaiting_review(state: dict) -> Optional[float]:
     return (datetime.now(timezone.utc) - started).total_seconds() / 3600
 
 
+def case_state(thread_id: str) -> dict:
+    """The state a thread currently holds.
+
+    Note *currently*: a thread keeps one state, and a later request on the same thread
+    replaces it — Test 7 continues Test 2's thread on purpose. To evaluate the case you
+    ran, read the `final_state` a scenario captured when it finished, not the thread.
+    """
+    return graph.get_state({"configurable": {"thread_id": thread_id}}).values
+
+
 def show_for_review(payload: dict) -> None:
     """Print the paused case the way a human reviewer needs to see it.
 
@@ -1954,6 +2112,11 @@ def run_scenario(title: str, user_request: str, decisions: Optional[list] = None
     """Demo wrapper: banner + `execute_workflow` + final output, for the test cases."""
     print("=" * 88); print(f"🧪 {title}"); print(f"USER REQUEST: {user_request}"); print("=" * 88)
     result = execute_workflow(user_request, decisions=decisions, thread_id=thread_id)
+    # Captured here, not read back at the end of the notebook: a thread holds one state,
+    # and a later scenario on the same thread replaces it. Test 7 continues Test 2's
+    # thread, so evaluating that thread afterwards scores the follow-up question rather
+    # than the investigation — which is exactly how a live run caught this.
+    result["final_state"] = case_state(result["thread_id"])
     print("\n🏁 FINAL OUTPUT:\n" + (result.get("final_output") or "(none)"))
     return result
 
@@ -2086,6 +2249,7 @@ if not SKIP_DEMOS:
     graph = build_graph(checkpointer)          # the original graph object is now gone
     print("\n🔄 graph rebuilt from scratch — resuming the same case from its checkpoint")
     t9 = resume_workflow(_paused["thread_id"], {"type": "approve"})
+    t9["final_state"] = case_state(_paused["thread_id"])   # as `run_scenario` does
     print("\n🏁 FINAL OUTPUT:\n" + (t9.get("final_output") or "(none)"))
 
 # %% [markdown]
@@ -2172,11 +2336,6 @@ def case_violations(state: dict, *, expect_signal_type: Optional[str] = None,
     return problems
 
 
-def case_state(thread_id: str) -> dict:
-    """The checkpointed state of a finished case — what the behavioural eval reads."""
-    return graph.get_state({"configurable": {"thread_id": thread_id}}).values
-
-
 def run_eval() -> list:
     """Score the rule engine against the labelled set. No LLM calls, so it is free."""
     rows = []
@@ -2213,20 +2372,22 @@ if not SKIP_DEMOS:
 
 # %%
 if not SKIP_DEMOS:
+    # Each scenario's state as it was when that scenario finished — not what its thread
+    # holds now. Test 7 continues Test 2's thread, so reading the thread here would score
+    # the follow-up question instead of the investigation.
     _behavioural = [
-        # thread,            expected signal type, expected action, what it proves
-        (t1["thread_id"], None, "CLEAR", "clean customer stays cleared"),
-        (t2["thread_id"], "FRAUD_ALERT", "BLOCK", "issuer alert classified and blocked"),
-        (t4["thread_id"], None, None, "rejected case leaked nothing"),
-        (t6["thread_id"], None, "BLOCK", "sanctions hard stop held"),
-        (t8["thread_id"], None, None, "injected instruction changed no reported number"),
-        (t9["thread_id"], None, None, "durable case reported the engine's score"),
+        # case state,        expected signal type, expected action, what it proves
+        (t1["final_state"], None, "CLEAR", "clean customer stays cleared"),
+        (t2["final_state"], "FRAUD_ALERT", "BLOCK", "issuer alert classified and blocked"),
+        (t4["final_state"], None, None, "rejected case leaked nothing"),
+        (t6["final_state"], None, "BLOCK", "sanctions hard stop held"),
+        (t8["final_state"], None, None, "injected instruction changed no reported number"),
+        (t9["final_state"], None, None, "durable case reported the engine's score"),
     ]
 
     _problems = []
     print(f"{'case':<22}{'score':>6}{'action':>9}   verdict")
-    for _thread, _signal, _action, _why in _behavioural:
-        _state = case_state(_thread)
+    for _state, _signal, _action, _why in _behavioural:
         _found = case_violations(_state, expect_signal_type=_signal, expect_action=_action)
         _problems += [f"{_state.get('customer_id')}: {p}" for p in _found]
         print(f"{str(_state.get('customer_id')):<22}"
@@ -2292,6 +2453,16 @@ if not SKIP_DEMOS:
         print(f"\n{'🔗' if _intact else '❌'} {_verdict}")
         if not _intact:
             raise AssertionError(f"audit trail integrity check failed: {_verdict}")
+
+        # Every finished run also leaves its own file, so one case can be read or handed
+        # over without the whole trail. They are extracts: the lines are copied verbatim,
+        # hashes and all, and `audit_log.jsonl` stays the artefact that proves nothing was
+        # removed — a missing extract is invisible, a missing *entry* breaks the chain.
+        _extracts = sorted(pathlib.Path(run_audit_path("run-x")).parent.glob("audit_run-*.jsonl"))
+        print(f"\n{len(_extracts)} per-run extract(s) alongside the trail:")
+        for _extract in _extracts[-3:]:
+            _ok, _msg = verify_audit_extract(str(_extract))
+            print(f"   {'✅' if _ok else '❌'} {_extract.name}  ({_msg})")
     else:
         print(f"(no audit trail at {AUDIT_LOG_PATH} — no case has been executed yet)")
 
@@ -2395,3 +2566,34 @@ if not SKIP_DEMOS:
 # What it still is not: there is no SLA on a case parked at the gate, attribution assumes
 # the graph is the only thing spending tokens, and the audit trail is a file rather than a
 # WORM store. Those are the next three things, and `production-migration-plan.md` says how.
+
+# %% [markdown]
+# ## 10. The audit trail of this run
+# Section 8.3 answered *is the record intact* — the chain, verified end to end. This
+# answers the other question an auditor asks: **what actually happened, case by case.**
+#
+# Everything below was written by the runs above, as they happened. Nothing here is
+# recomputed or re-narrated: it is the file on disk, grouped by `case_id` and printed.
+# For each case you can read the signal it opened on, what the reviewer decided (and the
+# feedback they gave), which action was executed under which prompt version, and the exact
+# words the customer received.
+#
+# On a local machine the trail accumulates across sessions, so it is filtered to the runs
+# *this* notebook performed; in Colab the runtime starts empty and the two are the same.
+
+# %%
+if not SKIP_DEMOS:
+    _session = session_audit_entries()
+    _cases = {e.get("case_id") for e in _session if e.get("case_id")}
+    print("=" * 88)
+    print(f"AUDIT TRAIL OF THIS RUN — {len(_session)} entries across {len(_cases)} cases")
+    print(f"source: {AUDIT_LOG_PATH}")
+    print("=" * 88)
+    print(format_audit_trail(_session))
+
+    _intact, _verdict = verify_audit_trail()
+    print("\n" + "=" * 88)
+    print(f"{'🔗' if _intact else '❌'} {_verdict}")
+    print("Hand one case over on its own with the per-run extract next to this file; "
+          "keep this trail\nfor the property the extracts cannot give you — a deleted "
+          "entry breaks the chain, a\ndeleted file does not.")

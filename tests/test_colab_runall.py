@@ -116,3 +116,10 @@ def test_artefacts_are_written_to_relative_paths():
     source = SOURCE.read_text(encoding="utf-8")
     assert 'os.getenv("FRAUD_AUDIT_LOG", "audit_log.jsonl")' in source
     assert 'os.getenv("FRAUD_CHECKPOINT_DB", "revolutbank_cases.sqlite")' in source
+
+
+def test_the_notebook_ends_by_printing_the_run_s_audit_trail(code_cells):
+    """The last thing a reviewer scrolls to is the record of what happened."""
+    last = code_cells[-1]
+    assert "format_audit_trail" in last and "session_audit_entries" in last
+    assert "verify_audit_trail" in last, "the trail is printed without being vouched for"
