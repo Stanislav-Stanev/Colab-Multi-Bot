@@ -11,11 +11,9 @@ import fraud_multi_agent as m
 
 
 @pytest.fixture(autouse=True)
-def fresh_observer(monkeypatch):
-    """Each test gets its own observer so counts never leak between tests."""
-    observer = m.WorkflowObserver()
-    monkeypatch.setattr(m, "OBS", observer)
-    return observer
+def _isolate_observer(fresh_observer):
+    """Every test in this module gets the isolated observer from conftest."""
+    return fresh_observer
 
 
 # --------------------------------------------------------------------- logging
@@ -146,8 +144,10 @@ def test_observe_node_restores_the_previous_node(fresh_observer):
 
 
 def test_decorator_keeps_the_function_identity():
-    assert m.intake.__name__ == "intake"
-    assert "intake" in (m.intake.__doc__ or "") or m.intake.__doc__ is None
+    """@observe_node wraps with functools.wraps, so nodes keep their name and docstring."""
+    assert m.triage.__name__ == "triage"
+    assert "Classify the incoming signal" in (m.triage.__doc__ or "")
+    assert m.comms_deliver.__name__ == "comms_deliver"
 
 
 # ------------------------------------------------------------------ attribution

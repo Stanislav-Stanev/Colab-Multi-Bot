@@ -4,3 +4,8 @@ __pycache__/
 .ipynb_checkpoints/
 *.zip
 workflow_events.json
+# run artefacts: checkpoint database (incl. WAL/shm sidecars) and the audit trail
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+audit_log.jsonl
