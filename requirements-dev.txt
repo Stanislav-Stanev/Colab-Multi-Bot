@@ -1,0 +1,15 @@
+# Pinned to the majors the notebook was validated against. langchain-anthropic < 1.7
+# has no `json_schema` structured-output method and every agent node would fail.
+langgraph>=1.2,<2
+langchain>=1.4,<2
+langchain-anthropic>=1.7,<2
+# Durable checkpoints on the runtime disk. 3.x is the major built against
+# langgraph-checkpoint 4.x: the 2.x line imports fine and then dies on the first write with
+# `'JsonPlusSerializer' object has no attribute 'dumps'`. Optional at runtime anyway —
+# `make_checkpointer` probes it and falls back to MemorySaver, so a bad wheel cannot break
+# "Run all"; the pin is here so the good path is the default.
+langgraph-checkpoint-sqlite>=3.1,<4
+python-dotenv
+jupytext
+pytest
+ipykernel

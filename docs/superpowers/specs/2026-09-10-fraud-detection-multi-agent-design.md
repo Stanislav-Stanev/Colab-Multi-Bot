@@ -59,7 +59,10 @@ Rejected alternatives: **B** supervisor/router agent (extra complexity, no rubri
 
 ### Agents
 
-1. **Fraud Analyst** (LLM node with bound tools): system prompt of a senior payments fraud analyst; must call the tools, then emit a structured risk assessment (Pydantic structured output).
+1. **Fraud Analyst** (LLM node with bound tools): system prompt of a senior payments fraud analyst;
+   must call the tools, then emit a structured `AnalystNarrative`. The risk score and triggered
+   rules are taken from the scoring engine's own output rather than from the model, so the number
+   that drives the decision is computed; the model contributes the prose and the sanctions verdict.
 2. **Compliance Officer** (LLM node): writes the compliance report + recommendation from the analyst's assessment; on human feedback revises the report (revision loop, `revision_count` guard ≤ 3).
 
 ### Tools (all self-contained, no external APIs beyond Anthropic)
@@ -70,19 +73,28 @@ Rejected alternatives: **B** supervisor/router agent (extra complexity, no rubri
 
 ### HITL mechanics
 
-`human_review` node calls `interrupt(payload)` with the report and recommended action. The caller receives `__interrupt__`, shows the report, collects a decision, and resumes with `Command(resume={"type": ..., "feedback": ...})`. Conditional edge routes to `execute_action` / `compliance_officer` / `cancel_action`.
+Routing after `intake`: a named customer starts an investigation; a request with no customer id
+on a thread that already holds a conversation is a follow-up answered from memory
+(`followup_qa`); on a fresh thread it goes to `no_customer`, which asks for an id without
+spending a token. `human_review` node calls `interrupt(payload)` with the report and recommended action. The caller receives `__interrupt__`, shows the report, collects a decision, and resumes with `Command(resume={"type": ..., "feedback": ...})`. Conditional edge routes to `execute_action` / `compliance_officer` / `cancel_action`.
 
 ### Core functions
 
-- `execute_workflow(user_request: str) -> dict` — creates a `thread_id`, invokes the compiled graph until interrupt or END, returns status + interrupt payload.
-- `resume_workflow(thread_id: str, decision: dict) -> dict` — resumes with `Command(resume=decision)`.
-- Convenience wrapper for tests: `run_scenario(user_request, decisions: list)` — feeds scripted human decisions to demonstrate HITL non-interactively (required for reproducible Colab execution).
+- `execute_workflow(user_request: str, *, decisions=None, thread_id=None) -> dict` — the required
+  entry point. Starts the graph and owns the whole HITL loop: on each interruption it shows the
+  report, obtains the human's decision (interactively via `input()`, or from a scripted
+  `decisions` list), resumes with `Command(resume=...)`, and repeats until the graph returns a
+  final output. The extra parameters are keyword-only with defaults, so the assignment's
+  `execute_workflow(user_request)` call works exactly as specified.
+- `start_workflow(user_request, thread_id=None)` / `resume_workflow(thread_id, decision)` — the
+  low-level halves, exposed so the notebook can show the pause explicitly.
+- `run_scenario(title, user_request, decisions)` — banner + `execute_workflow`, for the demo cells.
 
 ## 4. Environment compatibility (Colab + VS Code)
 
 - `get_secret(name)`: try `google.colab.userdata.get(name)` → fall back to `dotenv` `.env` → `os.environ`. Raises a clear message telling the user where to put the key in each environment.
 - `%pip install -qU langgraph langchain langchain-anthropic python-dotenv` as the first code cell (works in both environments).
-- Model: `claude-sonnet-5` via `langchain-anthropic` (configurable constant at the top).
+- Model: `claude-opus-5` via `langchain-anthropic` (configurable constant at the top).
 - No other environment-specific code anywhere.
 
 ## 5. Notebook structure
@@ -100,12 +112,17 @@ Rejected alternatives: **B** supervisor/router agent (extra complexity, no rubri
 
 ## 6. Test cases
 
-1. **Clean customer** → CLEAR recommendation, human approves.
-2. **Card-testing fraud** → BLOCK, human **approves** → card blocked.
-3. **Velocity fraud** → BLOCK, human gives **feedback** ("be less aggressive, suggest monitoring first") → report revised → approve.
-4. **Geo anomaly** → BLOCK/MONITOR, human **rejects** → action cancelled, case noted.
-5. **Unknown customer** → graceful error handling by the analyst (tool returns error, agent reports it).
-6. **Memory test** — follow-up question in the same `thread_id` ("what was the risk score again?") answered from checkpointed history.
+Scores below are what the rule engine actually computes, so each scripted human decision reads
+coherently against the report it responds to.
+
+1. **CUST-1001**, score 0 → CLEAR, human approves.
+2. **CUST-1042**, score 100 (card testing) → BLOCK, human **approves** → card blocked.
+3. **CUST-1337**, score 40 (velocity) → MONITOR, human gives **feedback** that monitoring is too
+   lenient → report revised upward → approve.
+4. **CUST-2077**, score 40 (geo anomaly + crypto/gambling MCCs) → MONITOR, human **rejects**.
+5. **CUST-9999** → unknown customer, graceful error handling.
+6. **CUST-4444**, score 15 but a **sanctions match** → BLOCK, showing a rule that overrides the score.
+7. **Memory test** — follow-up question in Test 2's `thread_id` answered from checkpointed history.
 
 ## 7. Error handling
 
